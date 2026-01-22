@@ -53,13 +53,14 @@ import json
 from sklearn.utils.class_weight import compute_sample_weight
 import inspect
 import copy
-from sklearn.utils import resample
 from sklearn.preprocessing import StandardScaler
 import ast
 
 SEED = 42
 scoring = 'f1'
 n_jobs = 8
+RESULTS_BASE_DIR = os.path.join("results")
+MODELS_BASE_DIR = RESULTS_BASE_DIR
 
 def create_results_structure(sets=("train", "test_1", "test_2", "test_3")):
     metrics = ["sensitivity", "specificity", "PPV", "NPV", "AUC"]
@@ -156,7 +157,7 @@ cols_to_scale = features
 X_train_scaled = scaler.fit_transform(train_data[cols_to_scale])
 
 # X_train_scaled = scaler.transform(train_data[cols_to_scale])
-X_train_scaled = pd.DataFrame(X_train_scaled, columns=[cols_to_scale], index=train_data.index)
+X_train_scaled = pd.DataFrame(X_train_scaled, columns=cols_to_scale, index=train_data.index)
 X_train_scaled.columns = [
     "_".join(map(str, col)) if isinstance(col, tuple) else col
     for col in X_train_scaled.columns
@@ -169,25 +170,11 @@ y_train = train_data["occuluded_artery"]
 #                        3. Create CV splits                         #
 ###############################################################################
 
-patient_counts_train = X_train_scaled['patient_id'].value_counts()
-multi_sample_patients_train = patient_counts_train[patient_counts_train >= 2].index
-mask_multi_train = X_train_scaled['patient_id'].isin(multi_sample_patients_train)
-
-X_multi = X_train_scaled[mask_multi_train]
-y_multi = y_train[mask_multi_train]
-groups_multi = X_multi['patient_id']
-X_multi_model = X_multi.drop(columns=['patient_id'])
-
-mask_single_train = ~mask_multi_train
-X_single = X_train_scaled[mask_single_train]
-y_single = y_train[mask_single_train]
-X_single_model = X_single.drop(columns=['patient_id'])
-
+groups = X_train_scaled['patient_id']
+X_model = X_train_scaled.drop(columns=['patient_id'])
+y_model = y_train
 cv = StratifiedGroupKFold(n_splits=10, random_state=SEED, shuffle=True)
-cv_splits = list(cv.split(X_multi_model, y_multi, groups=groups_multi))
-
-X_model = pd.concat([X_multi_model, X_single_model], ignore_index=True)
-y_model = pd.concat([y_multi, y_single], ignore_index=True)
+cv_splits = list(cv.split(X_model, y_model, groups=groups))
 
 
 ###############################################################################
@@ -369,127 +356,120 @@ parameters.update({"ETC": {
 #                     7. Tuning a classifier as final stage model             #
 ###############################################################################
 # Define classifier to use as the base of the recursive feature elimination algorithm
-for name, classifier in classifiers.items():
-    results = create_results_structure()
-    print(f"Tuning Classifier {name} — go grab a beer or something")
 
-    # Define parameter grid
-    param_grid = parameters[name]
+# removed for speed, with real runs add lopo back for all models to be run
+# for name, classifier in classifiers.items():
 
-    # Initialize GridSearch object
-    gscv = GridSearchCV(
-        classifier,
-        param_grid,
-        cv=cv_splits,
-        n_jobs=n_jobs,
-        verbose=1,
-        scoring=scoring,
-        error_score=0.0
-    )
+first_model = next(iter(classifiers.items()))
+name, classifier = first_model
+results = create_results_structure()
+print(f"Tuning Classifier {name} — go grab a beer or something")
 
-    # Compute sample weights to handle class imbalance
-    sample_weights = compute_sample_weight("balanced", y_model)
+# Define parameter grid
+param_grid = parameters[name]
 
-    # Try fitting with sample_weight if supported
-    fit_signature = inspect.signature(classifier.fit)
-    if "sample_weight" in fit_signature.parameters:
-        print(f" → {name} supports sample_weight. Using weighted fit.")
-        gscv.fit(X_model[features], y_model, sample_weight=sample_weights)
-    else:
-        print(f"{name} does NOT support sample_weight. Using random oversampling...")
-        X_majority = X_model[features][y_model == 0]
-        X_minority = X_model[features][y_model == 1]
-        y_majority = y_model[y_model == 0]
-        y_minority = y_model[y_model == 1]
+# Initialize GridSearch object
+gscv = GridSearchCV(
+    classifier,
+    param_grid,
+    cv=cv_splits,
+    n_jobs=n_jobs,
+    verbose=1,
+    scoring=scoring,
+    error_score=0.0
+)
+
+# Compute sample weights to handle class imbalance
+sample_weights = compute_sample_weight("balanced", y_model)
+
+# Try fitting with sample_weight if supported
+fit_signature = inspect.signature(classifier.fit)
+if "sample_weight" in fit_signature.parameters:
+    print(f" → {name} supports sample_weight. Using weighted fit.")
+    gscv.fit(X_model[features], y_model, sample_weight=sample_weights)
+else:
+    print(f"{name} does NOT support sample_weight. Using unweighted fit.")
+    gscv.fit(X_model[features], y_model)
+
+# Get best parameters and score
+best_params = gscv.best_params_
+best_score = gscv.best_score_
+best_classifier = gscv.best_estimator_
     
-        n_additional = len(X_majority) - len(X_minority)
-        X_minority_additional, y_minority_additional = resample(
-            X_minority, y_minority,
-            replace=True,
-            n_samples=n_additional,
-            random_state=SEED
-        )
-        
-        X_resampled = pd.concat([X_majority, X_minority, X_minority_additional])
-        y_resampled = pd.concat([y_majority, y_minority, y_minority_additional])
-        gscv.fit(X_resampled, y_resampled)
+# Update classifier parameters
+# tuned_params = {item: best_params[item] for item in best_params}
+# classifier.set_params(**tuned_params)
 
-    # Get best parameters and score
-    best_params = gscv.best_params_
-    best_score = gscv.best_score_
-    best_classifier = gscv.best_estimator_
-        
-    # Update classifier parameters
-    # tuned_params = {item: best_params[item] for item in best_params}
-    # classifier.set_params(**tuned_params)
-
-    #evaluating on train data
-    y_pred_train = best_classifier.predict_proba(X_train_scaled[features])[:, 1]
-    print_overall_results(results, y_train, y_pred_train, group="train", threshold=0.5)
-    print("")
-    print_results_by_artery(results, X_train_scaled, best_classifier, arteries, features, group="train", threshold=0.5)
+#evaluating on train data
+y_pred_train = best_classifier.predict_proba(X_train_scaled[features])[:, 1]
+print_overall_results(results, y_train, y_pred_train, group="train", threshold=0.5)
+print("")
+print_results_by_artery(results, X_train_scaled, best_classifier, arteries, features, group="train", threshold=0.5)
 
 
-    #test set 1
-    test_set_1 = pd.read_csv('data/data_ood_id/test_set_ood_1.csv')
-    X_test_1 = test_set_1.drop(columns=["occuluded_artery"])
-    y_test_1 = test_set_1["occuluded_artery"]
-    X_test_1_scaled = scaler.transform(X_test_1[cols_to_scale])
-    X_test_1_scaled = pd.DataFrame(X_test_1_scaled, columns=[cols_to_scale], index=X_test_1.index)
-    X_test_1_scaled.columns = [
-        "_".join(map(str, col)) if isinstance(col, tuple) else col
-        for col in X_test_1_scaled.columns
-    ]
-    X_test_1_scaled = pd.concat([X_test_1_scaled, X_test_1[list(donot_include_columns) + arteries]], axis=1)
-    y_pred_test_1 = best_classifier.predict_proba(X_test_1_scaled[features])[:, 1]
-    print_overall_results(results, y_test_1, y_pred_test_1, group="test_1", threshold=0.5)
-    print("")
-    print_results_by_artery(results, X_test_1_scaled, best_classifier, arteries, features, group="test_1", threshold=0.5)
+#test set 1
+test_set_1 = pd.read_csv('data/data_ood_id/test_set_ood_1.csv')
+X_test_1 = test_set_1.drop(columns=["occuluded_artery"])
+y_test_1 = test_set_1["occuluded_artery"]
+X_test_1_scaled = scaler.transform(X_test_1[cols_to_scale])
+X_test_1_scaled = pd.DataFrame(X_test_1_scaled, columns=cols_to_scale, index=X_test_1.index)
+X_test_1_scaled.columns = [
+    "_".join(map(str, col)) if isinstance(col, tuple) else col
+    for col in X_test_1_scaled.columns
+]
+X_test_1_scaled = pd.concat([X_test_1_scaled, X_test_1[list(donot_include_columns) + arteries]], axis=1)
+y_pred_test_1 = best_classifier.predict_proba(X_test_1_scaled[features])[:, 1]
+print_overall_results(results, y_test_1, y_pred_test_1, group="test_1", threshold=0.5)
+print("")
+print_results_by_artery(results, X_test_1_scaled, best_classifier, arteries, features, group="test_1", threshold=0.5)
 
-    #test set 2
-    test_set_2 = pd.read_csv('data/data_ood_id/test_set_ood_2.csv')
-    X_test_2 = test_set_2.drop(columns=["occuluded_artery"])
-    y_test_2 = test_set_2["occuluded_artery"]
-    X_test_2_scaled = scaler.transform(X_test_2[cols_to_scale])
-    X_test_2_scaled = pd.DataFrame(X_test_2_scaled, columns=[cols_to_scale], index=X_test_2.index)
-    X_test_2_scaled.columns = [
-        "_".join(map(str, col)) if isinstance(col, tuple) else col
-        for col in X_test_2_scaled.columns
-    ]
-    X_test_2_scaled = pd.concat([X_test_2_scaled, X_test_2[list(donot_include_columns) + arteries]], axis=1)
-    y_pred_test_2 = best_classifier.predict_proba(X_test_2_scaled[features])[:, 1]
-    print_overall_results(results, y_test_2, y_pred_test_2, group="test_2", threshold=0.5)
-    print("")
-    print_results_by_artery(results, X_test_2_scaled, best_classifier, arteries, features, group="test_2", threshold=0.5)
+#test set 2
+test_set_2 = pd.read_csv('data/data_ood_id/test_set_ood_2.csv')
+X_test_2 = test_set_2.drop(columns=["occuluded_artery"])
+y_test_2 = test_set_2["occuluded_artery"]
+X_test_2_scaled = scaler.transform(X_test_2[cols_to_scale])
+X_test_2_scaled = pd.DataFrame(X_test_2_scaled, columns=cols_to_scale, index=X_test_2.index)
+X_test_2_scaled.columns = [
+    "_".join(map(str, col)) if isinstance(col, tuple) else col
+    for col in X_test_2_scaled.columns
+]
+X_test_2_scaled = pd.concat([X_test_2_scaled, X_test_2[list(donot_include_columns) + arteries]], axis=1)
+y_pred_test_2 = best_classifier.predict_proba(X_test_2_scaled[features])[:, 1]
+print_overall_results(results, y_test_2, y_pred_test_2, group="test_2", threshold=0.5)
+print("")
+print_results_by_artery(results, X_test_2_scaled, best_classifier, arteries, features, group="test_2", threshold=0.5)
 
 
-    #test set 3
-    test_set_3 = pd.read_csv('data/data_ood_id/test_set_id.csv')
-    X_test_3 = test_set_3.drop(columns=["occuluded_artery"])
-    y_test_3 = test_set_3["occuluded_artery"]
-    X_test_3_scaled = scaler.transform(X_test_3[cols_to_scale])
-    X_test_3_scaled = pd.DataFrame(X_test_3_scaled, columns=[cols_to_scale], index=X_test_3.index)
-    X_test_3_scaled.columns = [
-        "_".join(map(str, col)) if isinstance(col, tuple) else col
-        for col in X_test_3_scaled.columns
-    ]
-    X_test_3_scaled = pd.concat([X_test_3_scaled, X_test_3[list(donot_include_columns) + arteries]], axis=1)
-    y_pred_test_3 = best_classifier.predict_proba(X_test_3_scaled[features])[:, 1]
-    print_overall_results(results, y_test_3, y_pred_test_3, group="test_3", threshold=0.5)
-    print("")
-    print_results_by_artery(results, X_test_3_scaled, best_classifier, arteries, features, group="test_3", threshold=0.5)
+#test set 3
+test_set_3 = pd.read_csv('data/data_ood_id/test_set_id.csv')
+X_test_3 = test_set_3.drop(columns=["occuluded_artery"])
+y_test_3 = test_set_3["occuluded_artery"]
+X_test_3_scaled = scaler.transform(X_test_3[cols_to_scale])
+X_test_3_scaled = pd.DataFrame(X_test_3_scaled, columns=cols_to_scale, index=X_test_3.index)
+X_test_3_scaled.columns = [
+    "_".join(map(str, col)) if isinstance(col, tuple) else col
+    for col in X_test_3_scaled.columns
+]
+X_test_3_scaled = pd.concat([X_test_3_scaled, X_test_3[list(donot_include_columns) + arteries]], axis=1)
+y_pred_test_3 = best_classifier.predict_proba(X_test_3_scaled[features])[:, 1]
+print_overall_results(results, y_test_3, y_pred_test_3, group="test_3", threshold=0.5)
+print("")
+print_results_by_artery(results, X_test_3_scaled, best_classifier, arteries, features, group="test_3", threshold=0.5)
 
-    os.makedirs(f'results/age_scaled/nate_common/{name}', exist_ok=True)
-    os.makedirs(f'models/age_scaled/nate_common/{name}', exist_ok=True)
-    with open(f'results/age_scaled/nate_common/{name}/final_model_f1_new_overlap.json', 'w') as f:
-        json.dump(results, f, indent=4)
+results_dir = os.path.join(RESULTS_BASE_DIR, name)
+models_dir = os.path.join(MODELS_BASE_DIR, name)
+results["best_params"] = best_params
+os.makedirs(results_dir, exist_ok=True)
+os.makedirs(models_dir, exist_ok=True)
+with open(os.path.join(results_dir, "final_model_f1_new_overlap.json"), 'w') as f:
+    json.dump(results, f, indent=4, default=str)
 
-    joblib.dump({
-        'model': best_classifier,
-        'features': features,
-        'scaler': scaler,
-        'cols': cols_to_scale,
-        'best_params': gscv.best_params_,
-    }, f'models/age_scaled/nate_common/{name}/final_model_f1_new_overlap.joblib')
+joblib.dump({
+    'model': best_classifier,
+    'features': features,
+    'scaler': scaler,
+    'cols': cols_to_scale,
+    'best_params': gscv.best_params_,
+}, os.path.join(models_dir, "final_model_f1_new_overlap.joblib"))
 
-    print(f"Done for {name}......")
+print(f"Done for {name}......")
