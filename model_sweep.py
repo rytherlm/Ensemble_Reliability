@@ -31,6 +31,11 @@
 #                          1. Importing Libraries                             #
 ###############################################################################
 # For reading, visualizing, and preprocessing data
+import warnings
+
+# Suppress sklearn parallel warnings before importing sklearn
+warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
+
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import GridSearchCV, KFold, StratifiedGroupKFold
@@ -102,7 +107,7 @@ def print_overall_results(results, y_true, y_pred, group="test", threshold=0.5):
     print(f"Overall {group}: AUC={auc}, sensitivity={sens}, specificity={spec}, PPV={ppv}, NPV={npv}")
 
 
-def print_results_by_artery(results, X, model, arteries, features, group="", threshold=0.5):
+def print_results_by_artery(results, X, y_true, model, arteries, features, group="", threshold=0.5):
     print(f"{group} results")
     for artery in arteries:
         other_arteries = [a for a in arteries if a != artery]
@@ -111,10 +116,11 @@ def print_results_by_artery(results, X, model, arteries, features, group="", thr
         self_mask = X[artery] == 1
         artery_mask = ((artery_1_mask & artery_2_mask) | self_mask)
         X_new = X[artery_mask]
+        y_new = y_true.loc[X_new.index]
         y_pred = model.predict_proba(X_new[features])[:, 1]
-        auc = roc_auc_score(X_new[artery], y_pred)
+        auc = roc_auc_score(y_new, y_pred)
         sens, spec, ppv, npv = sensitivity_specificity_ppv_npv(
-            X_new[artery], y_pred, threshold=threshold)
+            y_new, y_pred, threshold=threshold)
         if ppv is None:
             ppv = -10.0
         if npv is None:
@@ -361,7 +367,9 @@ parameters.update({"ETC": {
 # for name, classifier in classifiers.items():
 
 # Temporary debugging restriction: run only the first two models.
-model_items = list(classifiers.items())[:2]
+model_items = list(classifiers.items())[:4]
+# model_items = list(classifiers.items())
+
 for name, classifier in model_items:
     results = create_results_structure()
     print(f"Tuning Classifier {name} — go grab a beer or something")
@@ -405,7 +413,7 @@ for name, classifier in model_items:
     y_pred_train = best_classifier.predict_proba(X_train_scaled[features])[:, 1]
     print_overall_results(results, y_train, y_pred_train, group="train", threshold=0.5)
     print("")
-    print_results_by_artery(results, X_train_scaled, best_classifier, arteries, features, group="train", threshold=0.5)
+    print_results_by_artery(results, X_train_scaled, y_train, best_classifier, arteries, features, group="train", threshold=0.5)
 
 
     #test set 1
@@ -422,7 +430,7 @@ for name, classifier in model_items:
     y_pred_test_1 = best_classifier.predict_proba(X_test_1_scaled[features])[:, 1]
     print_overall_results(results, y_test_1, y_pred_test_1, group="test_1", threshold=0.5)
     print("")
-    print_results_by_artery(results, X_test_1_scaled, best_classifier, arteries, features, group="test_1", threshold=0.5)
+    print_results_by_artery(results, X_test_1_scaled, y_test_1, best_classifier, arteries, features, group="test_1", threshold=0.5)
 
     #test set 2
     test_set_2 = pd.read_csv('data/data_ood_id/test_set_ood_2.csv')
@@ -438,7 +446,7 @@ for name, classifier in model_items:
     y_pred_test_2 = best_classifier.predict_proba(X_test_2_scaled[features])[:, 1]
     print_overall_results(results, y_test_2, y_pred_test_2, group="test_2", threshold=0.5)
     print("")
-    print_results_by_artery(results, X_test_2_scaled, best_classifier, arteries, features, group="test_2", threshold=0.5)
+    print_results_by_artery(results, X_test_2_scaled, y_test_2, best_classifier, arteries, features, group="test_2", threshold=0.5)
 
 
     #test set 3
@@ -455,7 +463,7 @@ for name, classifier in model_items:
     y_pred_test_3 = best_classifier.predict_proba(X_test_3_scaled[features])[:, 1]
     print_overall_results(results, y_test_3, y_pred_test_3, group="test_3", threshold=0.5)
     print("")
-    print_results_by_artery(results, X_test_3_scaled, best_classifier, arteries, features, group="test_3", threshold=0.5)
+    print_results_by_artery(results, X_test_3_scaled, y_test_3, best_classifier, arteries, features, group="test_3", threshold=0.5)
 
     results_dir = os.path.join(RESULTS_BASE_DIR, name)
     models_dir = os.path.join(MODELS_BASE_DIR, name)

@@ -28,7 +28,13 @@ import subprocess
 import sys
 
 import joblib
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
+from sklearn.calibration import calibration_curve
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import brier_score_loss, log_loss
+from sklearn.model_selection import StratifiedGroupKFold
 
 
 ###############################################################################
@@ -44,12 +50,15 @@ TRAIN_PATH = os.path.join(ROOT_DIR, "data", "data_ood_id", "train_data.csv")
 TEST_OOD_1_PATH = os.path.join(ROOT_DIR, "data", "data_ood_id", "test_set_ood_1.csv")
 TEST_OOD_2_PATH = os.path.join(ROOT_DIR, "data", "data_ood_id", "test_set_ood_2.csv")
 TEST_ID_PATH = os.path.join(ROOT_DIR, "data", "data_ood_id", "test_set_id.csv")
+VALIDATION_PATH = os.path.join(ROOT_DIR, "data", "data_ood_id", "validation_data.csv")
 
 RESULTS_DIR = os.path.join(ROOT_DIR, "results")
 ACCURACY_PATH = os.path.join(RESULTS_DIR, "accuracy_summary.json")
 ENSEMBLES_DIR = os.path.join(RESULTS_DIR, "ensembles")
+CALIBRATION_DIR = os.path.join(RESULTS_DIR, "calibration")
 
 DATASETS = [
+    ("validation", VALIDATION_PATH),
     ("test_set_ood_1", TEST_OOD_1_PATH),
     ("test_set_ood_2", TEST_OOD_2_PATH),
     ("test_set_id", TEST_ID_PATH)
@@ -57,6 +66,8 @@ DATASETS = [
 
 PROBABILITY_THRESHOLD = 0.5
 TOP_K_MODELS = 5
+CALIBRATION_SPLIT = "validation"
+CALIBRATION_BINS = 10
 OUTPUT_COLUMNS = ["filename","patient_id","left_circumflex","right_coronary_artery","left_anterior_descending","occuluded_artery"]
 
 req_files = [
@@ -91,6 +102,36 @@ def ensure_inputs():
     print("Data generation ran.")
 
 
+def ensure_validation_split():
+    if os.path.exists(VALIDATION_PATH):
+        print("Validation split exists.")
+        return
+
+    if not os.path.exists(TRAIN_PATH):
+        print("ERROR: train_data.csv missing; cannot create validation split.")
+        sys.exit(1)
+
+    train_df = pd.read_csv(TRAIN_PATH)
+    required_columns = {"patient_id", "occuluded_artery"}
+    if not required_columns.issubset(train_df.columns):
+        print("ERROR: train_data.csv missing required columns for validation split.")
+        sys.exit(1)
+
+    splitter = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+    y = train_df["occuluded_artery"]
+    groups = train_df["patient_id"]
+
+    try:
+        _, validation_indices = next(splitter.split(train_df, y, groups))
+    except ValueError as exc:
+        print(f"ERROR: failed to create validation split: {exc}")
+        sys.exit(1)
+
+    validation_df = train_df.iloc[validation_indices].copy()
+    validation_df.to_csv(VALIDATION_PATH, index=False)
+    print("Validation split created.")
+
+
 def run_model_sweep():
     result = subprocess.run([sys.executable, MODEL_SWEEP_PATH], cwd=ROOT_DIR)
     if result.returncode != 0:
@@ -100,6 +141,9 @@ def run_model_sweep():
 
 
 def export_probabilities():
+    if not os.path.exists(VALIDATION_PATH):
+        ensure_validation_split()
+
     accuracy_rows = []
     bundles = []
     if os.path.isdir(RESULTS_DIR):
@@ -189,7 +233,7 @@ def soft_voting_ensemble(probabilities):
     return ensemble_probability, ensemble_pred
 
 
-def performance_weighted_soft_voting_ensemble(probabilities, accuracy_path=ACCURACY_PATH, weight_split="test_set_id"):
+def performance_weighted_soft_voting_ensemble(probabilities, accuracy_path=ACCURACY_PATH, weight_split=CALIBRATION_SPLIT):
     if isinstance(probabilities, dict):
         prob_df = pd.DataFrame(probabilities)
         model_names = list(probabilities.keys())
@@ -220,8 +264,6 @@ def performance_weighted_soft_voting_ensemble(probabilities, accuracy_path=ACCUR
         split_scores = [acc for split, acc in entries if split == weight_split]
         if split_scores:
             raw_weights[model] = sum(split_scores) / len(split_scores)
-        elif entries:
-            raw_weights[model] = sum(acc for _, acc in entries) / len(entries)
         else:
             raw_weights[model] = 0.0
 
@@ -237,7 +279,7 @@ def performance_weighted_soft_voting_ensemble(probabilities, accuracy_path=ACCUR
     return ensemble_probability, ensemble_pred, normalized_weights
 
 
-def k_filter_voting_ensemble(probabilities, accuracy_path=ACCURACY_PATH, weight_split="test_set_id", k=TOP_K_MODELS):
+def k_filter_voting_ensemble(probabilities, accuracy_path=ACCURACY_PATH, weight_split=CALIBRATION_SPLIT, k=TOP_K_MODELS):
     if isinstance(probabilities, dict):
         prob_df = pd.DataFrame(probabilities)
         model_names = list(probabilities.keys())
@@ -268,8 +310,6 @@ def k_filter_voting_ensemble(probabilities, accuracy_path=ACCURACY_PATH, weight_
         split_scores = [acc for split, acc in entries if split == weight_split]
         if split_scores:
             model_scores[model] = sum(split_scores) / len(split_scores)
-        elif entries:
-            model_scores[model] = sum(acc for _, acc in entries) / len(entries)
         else:
             model_scores[model] = 0.0
 
@@ -340,8 +380,8 @@ def run_ensemble_methods():
         methods = [
             ("hard_voting", hard_voting_ensemble, {}),
             ("soft_voting", soft_voting_ensemble, {}),
-            ("performance_weighted_soft", performance_weighted_soft_voting_ensemble, {"accuracy_path": ACCURACY_PATH, "weight_split": "test_set_id"}),
-            ("k_filter_voting", k_filter_voting_ensemble, {"accuracy_path": ACCURACY_PATH, "weight_split": "test_set_id", "k": TOP_K_MODELS}),
+            ("performance_weighted_soft", performance_weighted_soft_voting_ensemble, {"accuracy_path": ACCURACY_PATH, "weight_split": CALIBRATION_SPLIT}),
+            ("k_filter_voting", k_filter_voting_ensemble, {"accuracy_path": ACCURACY_PATH, "weight_split": CALIBRATION_SPLIT, "k": TOP_K_MODELS}),
         ]
 
         for method_name, method_fn, method_kwargs in methods:
@@ -396,6 +436,233 @@ def run_ensemble_methods():
     print("Ensemble methods completed.")
 
 
+def run_probability_calibration():
+    if not os.path.isdir(RESULTS_DIR):
+        print("ERROR: results/ directory not found; skipping calibration.")
+        return
+
+    os.makedirs(CALIBRATION_DIR, exist_ok=True)
+    split_names = [split_name for split_name, _ in DATASETS]
+    summary_rows = []
+
+    def expected_calibration_error(y_true, probabilities, n_bins=CALIBRATION_BINS):
+        y_true = np.asarray(y_true, dtype=float)
+        probabilities = np.asarray(probabilities, dtype=float)
+        if len(probabilities) == 0:
+            return 0.0
+
+        bins = np.linspace(0.0, 1.0, n_bins + 1)
+        bin_ids = np.digitize(probabilities, bins[1:-1], right=False)
+        ece = 0.0
+
+        for bin_index in range(n_bins):
+            mask = bin_ids == bin_index
+            if not mask.any():
+                continue
+            bin_probability_mean = probabilities[mask].mean()
+            bin_outcome_mean = y_true[mask].mean()
+            ece += (mask.sum() / len(probabilities)) * abs(
+                bin_outcome_mean - bin_probability_mean
+            )
+
+        return float(ece)
+
+    def fit_calibrator(probabilities, y_true):
+        y_true = np.asarray(y_true, dtype=int)
+        probabilities = np.asarray(probabilities, dtype=float)
+        if len(np.unique(y_true)) < 2:
+            return None, "identity_single_class"
+
+        calibrator = LogisticRegression(max_iter=1000, solver="lbfgs")
+        calibrator.fit(probabilities.reshape(-1, 1), y_true)
+        return calibrator, "platt_sigmoid"
+
+    def apply_calibration(probabilities, calibrator):
+        probabilities = np.asarray(probabilities, dtype=float)
+        probabilities = np.clip(probabilities, 0.0, 1.0)
+        if calibrator is None:
+            return probabilities
+        calibrated = calibrator.predict_proba(probabilities.reshape(-1, 1))[:, 1]
+        return np.clip(calibrated, 0.0, 1.0)
+
+    sources = []
+    for source_name in sorted(os.listdir(RESULTS_DIR)):
+        source_path = os.path.join(RESULTS_DIR, source_name)
+        if not os.path.isdir(source_path):
+            continue
+        if source_name in {"ensembles", "calibration"}:
+            continue
+        sources.append(
+            {
+                "source_type": "model",
+                "source_name": source_name,
+                "source_path": source_path,
+                "probability_column": "mi_probability",
+            }
+        )
+
+    if os.path.isdir(ENSEMBLES_DIR):
+        for source_name in sorted(os.listdir(ENSEMBLES_DIR)):
+            source_path = os.path.join(ENSEMBLES_DIR, source_name)
+            if not os.path.isdir(source_path):
+                continue
+            sources.append(
+                {
+                    "source_type": "ensemble",
+                    "source_name": source_name,
+                    "source_path": source_path,
+                    "probability_column": "ensemble_probability",
+                }
+            )
+
+    if not sources:
+        print("ERROR: no model or ensemble probability sources found; skipping calibration.")
+        return
+
+    for source in sources:
+        source_type = source["source_type"]
+        source_name = source["source_name"]
+        source_path = source["source_path"]
+        probability_column = source["probability_column"]
+
+        calibration_path = os.path.join(
+            source_path, f"probabilities_{CALIBRATION_SPLIT}.csv"
+        )
+        if not os.path.exists(calibration_path):
+            print(
+                f"WARNING: {source_type} {source_name} missing {CALIBRATION_SPLIT}; skipping."
+            )
+            continue
+
+        calibration_df = pd.read_csv(calibration_path)
+        required_columns = set(OUTPUT_COLUMNS + [probability_column])
+        if not required_columns.issubset(calibration_df.columns):
+            print(
+                f"WARNING: {source_type} {source_name} missing required columns; skipping."
+            )
+            continue
+
+        calibrator, calibration_method = fit_calibrator(
+            calibration_df[probability_column].to_numpy(),
+            calibration_df["occuluded_artery"].to_numpy(),
+        )
+
+        out_dir = os.path.join(CALIBRATION_DIR, f"{source_type}s", source_name)
+        os.makedirs(out_dir, exist_ok=True)
+
+        for split_name in split_names:
+            split_path = os.path.join(source_path, f"probabilities_{split_name}.csv")
+            if not os.path.exists(split_path):
+                print(
+                    f"WARNING: {source_type} {source_name} missing split {split_name}; skipping split."
+                )
+                continue
+
+            split_df = pd.read_csv(split_path)
+            if not required_columns.issubset(split_df.columns):
+                print(
+                    f"WARNING: {source_type} {source_name} split {split_name} missing required columns; skipping split."
+                )
+                continue
+
+            y_true = split_df["occuluded_artery"].to_numpy(dtype=int)
+            raw_probability = split_df[probability_column].to_numpy(dtype=float)
+            calibrated_probability = apply_calibration(raw_probability, calibrator)
+
+            output = split_df[OUTPUT_COLUMNS].copy()
+            output["raw_probability"] = raw_probability
+            output["calibrated_probability"] = calibrated_probability
+            output["calibrated_pred"] = (
+                output["calibrated_probability"] >= PROBABILITY_THRESHOLD
+            ).astype(int)
+            output_path = os.path.join(out_dir, f"probabilities_{split_name}.csv")
+            output.to_csv(output_path, index=False)
+
+            raw_probability_clipped = np.clip(raw_probability, 1e-15, 1.0 - 1e-15)
+            calibrated_probability_clipped = np.clip(
+                calibrated_probability, 1e-15, 1.0 - 1e-15
+            )
+
+            raw_brier = brier_score_loss(y_true, raw_probability)
+            calibrated_brier = brier_score_loss(y_true, calibrated_probability)
+            raw_log_loss = log_loss(y_true, raw_probability_clipped, labels=[0, 1])
+            calibrated_log_loss = log_loss(
+                y_true, calibrated_probability_clipped, labels=[0, 1]
+            )
+            raw_ece = expected_calibration_error(y_true, raw_probability)
+            calibrated_ece = expected_calibration_error(y_true, calibrated_probability)
+            calibrated_accuracy = (
+                (output["calibrated_pred"] == output["occuluded_artery"]).mean() * 100.0
+            )
+
+            try:
+                raw_true, raw_pred = calibration_curve(
+                    y_true, raw_probability, n_bins=CALIBRATION_BINS, strategy="uniform"
+                )
+            except ValueError:
+                raw_true, raw_pred = np.array([]), np.array([])
+
+            try:
+                calibrated_true, calibrated_pred = calibration_curve(
+                    y_true,
+                    calibrated_probability,
+                    n_bins=CALIBRATION_BINS,
+                    strategy="uniform",
+                )
+            except ValueError:
+                calibrated_true, calibrated_pred = np.array([]), np.array([])
+
+            plt.figure(figsize=(5, 5))
+            plt.plot([0, 1], [0, 1], linestyle="--", color="black", linewidth=1, label="Perfect")
+            if len(raw_true):
+                plt.plot(raw_pred, raw_true, marker="o", linewidth=1.5, label="Raw")
+            if len(calibrated_true):
+                plt.plot(
+                    calibrated_pred,
+                    calibrated_true,
+                    marker="o",
+                    linewidth=1.5,
+                    label="Calibrated",
+                )
+            plt.title(f"{source_name} {split_name}")
+            plt.xlabel("Predicted probability")
+            plt.ylabel("Observed frequency")
+            plt.xlim(0, 1)
+            plt.ylim(0, 1)
+            plt.grid(True, alpha=0.3)
+            plt.legend(loc="best")
+            plt.tight_layout()
+            plot_path = os.path.join(out_dir, f"calibration_plot_{split_name}.png")
+            plt.savefig(plot_path, dpi=150)
+            plt.close()
+
+            summary_rows.append(
+                {
+                    "source_type": source_type,
+                    "source_name": source_name,
+                    "split": split_name,
+                    "calibration_split": CALIBRATION_SPLIT,
+                    "calibration_method": calibration_method,
+                    "accuracy_percent_calibrated": round(calibrated_accuracy, 2),
+                    "brier_raw": round(float(raw_brier), 6),
+                    "brier_calibrated": round(float(calibrated_brier), 6),
+                    "log_loss_raw": round(float(raw_log_loss), 6),
+                    "log_loss_calibrated": round(float(calibrated_log_loss), 6),
+                    "ece_raw": round(float(raw_ece), 6),
+                    "ece_calibrated": round(float(calibrated_ece), 6),
+                    "n_samples": int(len(split_df)),
+                }
+            )
+
+    if summary_rows:
+        summary_path = os.path.join(CALIBRATION_DIR, "calibration_summary.json")
+        with open(summary_path, "w") as handle:
+            json.dump(summary_rows, handle, indent=2)
+        print("Probability calibration completed.")
+    else:
+        print("WARNING: no calibration outputs generated.")
+
+
 
 
 ###############################################################################
@@ -403,9 +670,11 @@ def run_ensemble_methods():
 ###############################################################################
 def main():
     ensure_inputs()
+    ensure_validation_split()
     run_model_sweep()
     export_probabilities()
     run_ensemble_methods()
+    run_probability_calibration()
 
 
 if __name__ == "__main__":
