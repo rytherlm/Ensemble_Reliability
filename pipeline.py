@@ -56,6 +56,7 @@ RESULTS_DIR = os.path.join(ROOT_DIR, "results")
 ACCURACY_PATH = os.path.join(RESULTS_DIR, "accuracy_summary.json")
 ENSEMBLES_DIR = os.path.join(RESULTS_DIR, "ensembles")
 CALIBRATION_DIR = os.path.join(RESULTS_DIR, "calibration")
+ABSTAIN_DIR = os.path.join(RESULTS_DIR, "abstain_uncertainty")
 
 DATASETS = [
     ("validation", VALIDATION_PATH),
@@ -68,6 +69,14 @@ PROBABILITY_THRESHOLD = 0.5
 TOP_K_MODELS = 5
 CALIBRATION_SPLIT = "validation"
 CALIBRATION_BINS = 10
+ABSTAIN_TARGET_ERROR_RATE = 0.10
+ABSTAIN_THRESHOLD_STEPS = 101
+ABSTAIN_ENSEMBLE_PRIORITY = [
+    "performance_weighted_soft",
+    "soft_voting",
+    "k_filter_voting",
+    "hard_voting",
+]
 OUTPUT_COLUMNS = ["filename","patient_id","left_circumflex","right_coronary_artery","left_anterior_descending","occuluded_artery"]
 
 req_files = [
@@ -663,6 +672,307 @@ def run_probability_calibration():
         print("WARNING: no calibration outputs generated.")
 
 
+def run_abstain_uncertainty_logic():
+    if not os.path.isdir(CALIBRATION_DIR):
+        print("ERROR: calibration directory not found; skipping abstain logic.")
+        return
+
+    os.makedirs(ABSTAIN_DIR, exist_ok=True)
+
+    ensembles_calibration_dir = os.path.join(CALIBRATION_DIR, "ensembles")
+    models_calibration_dir = os.path.join(CALIBRATION_DIR, "models")
+    if not os.path.isdir(ensembles_calibration_dir):
+        print("ERROR: calibrated ensemble outputs missing; skipping abstain logic.")
+        return
+    if not os.path.isdir(models_calibration_dir):
+        print("ERROR: calibrated model outputs missing; skipping abstain logic.")
+        return
+
+    selected_ensemble_method = None
+    for method_name in ABSTAIN_ENSEMBLE_PRIORITY:
+        method_path = os.path.join(
+            ensembles_calibration_dir, method_name, f"probabilities_{CALIBRATION_SPLIT}.csv"
+        )
+        if os.path.exists(method_path):
+            selected_ensemble_method = method_name
+            break
+
+    if selected_ensemble_method is None:
+        print("ERROR: no calibrated ensemble probabilities found for abstain logic.")
+        return
+
+    model_names = sorted(
+        [
+            name
+            for name in os.listdir(models_calibration_dir)
+            if os.path.isdir(os.path.join(models_calibration_dir, name))
+        ]
+    )
+    if not model_names:
+        print("ERROR: no calibrated model directories found for abstain logic.")
+        return
+
+    def load_sorted_split(path, required_probability_column):
+        df = pd.read_csv(path)
+        required_columns = set(OUTPUT_COLUMNS + [required_probability_column])
+        if not required_columns.issubset(df.columns):
+            return None
+        df = df.sort_values(["patient_id", "filename"]).reset_index(drop=True)
+        return df
+
+    def build_split_bundle(split_name):
+        ensemble_path = os.path.join(
+            ensembles_calibration_dir,
+            selected_ensemble_method,
+            f"probabilities_{split_name}.csv",
+        )
+        if not os.path.exists(ensemble_path):
+            print(
+                f"WARNING: missing calibrated ensemble probabilities for {split_name}; skipping split."
+            )
+            return None
+
+        ensemble_df = load_sorted_split(ensemble_path, "calibrated_probability")
+        if ensemble_df is None:
+            print(
+                f"WARNING: calibrated ensemble file missing columns for {split_name}; skipping split."
+            )
+            return None
+
+        base_keys = ensemble_df[["patient_id", "filename"]].copy().reset_index(drop=True)
+        model_pred_columns = []
+        model_prob_columns = []
+        models_used = []
+
+        for model_name in model_names:
+            model_path = os.path.join(
+                models_calibration_dir, model_name, f"probabilities_{split_name}.csv"
+            )
+            if not os.path.exists(model_path):
+                continue
+
+            model_df = load_sorted_split(model_path, "calibrated_probability")
+            if model_df is None:
+                print(
+                    f"WARNING: calibrated model file missing columns: {model_name} {split_name}; skipping model."
+                )
+                continue
+
+            model_keys = model_df[["patient_id", "filename"]].copy().reset_index(drop=True)
+            if not model_keys.equals(base_keys):
+                print(
+                    f"WARNING: calibrated model keys mismatch: {model_name} {split_name}; skipping model."
+                )
+                continue
+
+            model_probability = model_df["calibrated_probability"].to_numpy(dtype=float)
+            model_prediction = (model_probability >= PROBABILITY_THRESHOLD).astype(int)
+            model_prob_columns.append(model_probability)
+            model_pred_columns.append(model_prediction)
+            models_used.append(model_name)
+
+        if not model_pred_columns:
+            print(f"ERROR: no aligned calibrated models available for {split_name}; skipping split.")
+            return None
+
+        model_pred_matrix = np.column_stack(model_pred_columns)
+        model_prob_matrix = np.column_stack(model_prob_columns)
+        return {
+            "ensemble_df": ensemble_df,
+            "model_pred_matrix": model_pred_matrix,
+            "model_prob_matrix": model_prob_matrix,
+            "models_used": models_used,
+        }
+
+    def disagreement_from_predictions(model_pred_matrix):
+        positive_fraction = model_pred_matrix.mean(axis=1)
+        return 1.0 - np.abs((2.0 * positive_fraction) - 1.0)
+
+    validation_bundle = build_split_bundle(CALIBRATION_SPLIT)
+    if validation_bundle is None:
+        print("ERROR: validation bundle unavailable for abstain threshold selection.")
+        return
+
+    validation_df = validation_bundle["ensemble_df"]
+    validation_probability = validation_df["calibrated_probability"].to_numpy(dtype=float)
+    validation_pred = (validation_probability >= PROBABILITY_THRESHOLD).astype(int)
+    validation_y = validation_df["occuluded_artery"].to_numpy(dtype=int)
+    validation_confidence = np.abs((validation_probability * 2.0) - 1.0)
+    validation_disagreement = disagreement_from_predictions(
+        validation_bundle["model_pred_matrix"]
+    )
+
+    confidence_threshold_grid = np.linspace(0.0, 1.0, ABSTAIN_THRESHOLD_STEPS)
+    disagreement_threshold_grid = np.linspace(0.0, 1.0, ABSTAIN_THRESHOLD_STEPS)
+    feasible_choice = None
+    fallback_choice = None
+
+    for confidence_threshold in confidence_threshold_grid:
+        confidence_mask = validation_confidence >= confidence_threshold
+        for disagreement_threshold in disagreement_threshold_grid:
+            keep_mask = confidence_mask & (validation_disagreement <= disagreement_threshold)
+            coverage = keep_mask.mean()
+            if coverage <= 0:
+                continue
+
+            error_rate = (
+                (validation_pred[keep_mask] != validation_y[keep_mask]).mean()
+            )
+
+            if fallback_choice is None:
+                fallback_choice = (coverage, error_rate, confidence_threshold, disagreement_threshold)
+            else:
+                best_coverage, best_error, _, _ = fallback_choice
+                if (error_rate < best_error) or (
+                    abs(error_rate - best_error) < 1e-12 and coverage > best_coverage
+                ):
+                    fallback_choice = (
+                        coverage,
+                        error_rate,
+                        confidence_threshold,
+                        disagreement_threshold,
+                    )
+
+            if error_rate <= ABSTAIN_TARGET_ERROR_RATE:
+                if feasible_choice is None:
+                    feasible_choice = (
+                        coverage,
+                        error_rate,
+                        confidence_threshold,
+                        disagreement_threshold,
+                    )
+                else:
+                    best_coverage, best_error, _, _ = feasible_choice
+                    if (coverage > best_coverage) or (
+                        abs(coverage - best_coverage) < 1e-12 and error_rate < best_error
+                    ):
+                        feasible_choice = (
+                            coverage,
+                            error_rate,
+                            confidence_threshold,
+                            disagreement_threshold,
+                        )
+
+    if feasible_choice is None and fallback_choice is None:
+        print("ERROR: failed to determine abstain thresholds.")
+        return
+
+    if feasible_choice is not None:
+        (
+            selected_coverage,
+            selected_error_rate,
+            confidence_threshold,
+            disagreement_threshold,
+        ) = feasible_choice
+        threshold_selection_mode = "target_error_constrained"
+    else:
+        (
+            selected_coverage,
+            selected_error_rate,
+            confidence_threshold,
+            disagreement_threshold,
+        ) = fallback_choice
+        threshold_selection_mode = "fallback_min_error"
+
+    summary_rows = []
+    split_names = [split_name for split_name, _ in DATASETS]
+    for split_name in split_names:
+        split_bundle = build_split_bundle(split_name)
+        if split_bundle is None:
+            continue
+
+        ensemble_df = split_bundle["ensemble_df"]
+        model_pred_matrix = split_bundle["model_pred_matrix"]
+        model_prob_matrix = split_bundle["model_prob_matrix"]
+        models_used = split_bundle["models_used"]
+
+        y_true = ensemble_df["occuluded_artery"].to_numpy(dtype=int)
+        calibrated_probability = ensemble_df["calibrated_probability"].to_numpy(dtype=float)
+        confidence = np.abs((calibrated_probability * 2.0) - 1.0)
+        disagreement = disagreement_from_predictions(model_pred_matrix)
+        model_probability_std = model_prob_matrix.std(axis=1)
+        binary_pred = (calibrated_probability >= PROBABILITY_THRESHOLD).astype(int)
+
+        abstain_mask = (confidence < confidence_threshold) | (
+            disagreement > disagreement_threshold
+        )
+        final_pred = np.where(abstain_mask, -1, binary_pred)
+        final_decision = np.where(
+            abstain_mask,
+            "not_sure",
+            np.where(binary_pred == 1, "yes", "no"),
+        )
+
+        output = ensemble_df[OUTPUT_COLUMNS].copy()
+        output["ensemble_method"] = selected_ensemble_method
+        output["calibrated_probability"] = calibrated_probability
+        output["confidence_score"] = confidence
+        output["model_disagreement"] = disagreement
+        output["model_probability_std"] = model_probability_std
+        output["abstain"] = abstain_mask.astype(int)
+        output["final_pred"] = final_pred.astype(int)
+        output["final_decision"] = final_decision
+
+        out_path = os.path.join(ABSTAIN_DIR, f"decisions_{split_name}.csv")
+        output.to_csv(out_path, index=False)
+
+        coverage_mask = ~abstain_mask
+        coverage = coverage_mask.mean()
+        abstain_rate = abstain_mask.mean()
+        if coverage_mask.any():
+            covered_accuracy = (binary_pred[coverage_mask] == y_true[coverage_mask]).mean()
+        else:
+            covered_accuracy = 0.0
+        overall_correct_non_abstain = (
+            ((binary_pred == y_true) & coverage_mask).sum() / len(y_true)
+        )
+
+        summary_rows.append(
+            {
+                "split": split_name,
+                "ensemble_method": selected_ensemble_method,
+                "n_samples": int(len(ensemble_df)),
+                "n_models": len(models_used),
+                "models_used": models_used,
+                "confidence_threshold": round(float(confidence_threshold), 4),
+                "disagreement_threshold": round(float(disagreement_threshold), 4),
+                "target_error_rate": ABSTAIN_TARGET_ERROR_RATE,
+                "coverage_percent": round(float(coverage * 100.0), 2),
+                "abstain_percent": round(float(abstain_rate * 100.0), 2),
+                "covered_accuracy_percent": round(float(covered_accuracy * 100.0), 2),
+                "covered_error_percent": round(float((1.0 - covered_accuracy) * 100.0), 2),
+                "overall_non_abstain_correct_percent": round(
+                    float(overall_correct_non_abstain * 100.0), 2
+                ),
+            }
+        )
+
+    thresholds_used = {
+        "ensemble_method": selected_ensemble_method,
+        "selection_mode": threshold_selection_mode,
+        "calibration_split": CALIBRATION_SPLIT,
+        "target_error_rate": ABSTAIN_TARGET_ERROR_RATE,
+        "confidence_threshold": round(float(confidence_threshold), 4),
+        "disagreement_threshold": round(float(disagreement_threshold), 4),
+        "validation_coverage_percent": round(float(selected_coverage * 100.0), 2),
+        "validation_error_percent": round(float(selected_error_rate * 100.0), 2),
+        "n_models_validation": len(validation_bundle["models_used"]),
+        "models_used_validation": validation_bundle["models_used"],
+    }
+
+    thresholds_path = os.path.join(ABSTAIN_DIR, "thresholds_used.json")
+    with open(thresholds_path, "w") as handle:
+        json.dump(thresholds_used, handle, indent=2)
+
+    if summary_rows:
+        summary_path = os.path.join(ABSTAIN_DIR, "abstain_uncertainty_summary.json")
+        with open(summary_path, "w") as handle:
+            json.dump(summary_rows, handle, indent=2)
+        print("Abstain and uncertainty outputs completed.")
+    else:
+        print("WARNING: no abstain and uncertainty outputs generated.")
+
+
 
 
 ###############################################################################
@@ -675,6 +985,7 @@ def main():
     export_probabilities()
     run_ensemble_methods()
     run_probability_calibration()
+    run_abstain_uncertainty_logic()
 
 
 if __name__ == "__main__":
