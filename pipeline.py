@@ -24,6 +24,7 @@
 ###############################################################################
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -53,10 +54,13 @@ TEST_ID_PATH = os.path.join(ROOT_DIR, "data", "data_ood_id", "test_set_id.csv")
 VALIDATION_PATH = os.path.join(ROOT_DIR, "data", "data_ood_id", "validation_data.csv")
 
 RESULTS_DIR = os.path.join(ROOT_DIR, "results")
+MODEL_OUTPUTS_DIR = os.path.join(RESULTS_DIR, "model_outputs")
 ACCURACY_PATH = os.path.join(RESULTS_DIR, "accuracy_summary.json")
 ENSEMBLES_DIR = os.path.join(RESULTS_DIR, "ensembles")
 CALIBRATION_DIR = os.path.join(RESULTS_DIR, "calibration")
 ABSTAIN_DIR = os.path.join(RESULTS_DIR, "abstain_uncertainty")
+FEATURE_IMPORTANCE_DIR = os.path.join(RESULTS_DIR, "feature_importance")
+FINAL_PLOTS_DIR = os.path.join(RESULTS_DIR, "final_plots")
 
 DATASETS = [
     ("validation", VALIDATION_PATH),
@@ -72,11 +76,14 @@ CALIBRATION_BINS = 10
 ABSTAIN_TARGET_ERROR_RATE = 0.10
 ABSTAIN_THRESHOLD_STEPS = 101
 ABSTAIN_ENSEMBLE_PRIORITY = [
+    "stacking_logistic",
     "performance_weighted_soft",
     "soft_voting",
     "k_filter_voting",
     "hard_voting",
 ]
+FEATURE_SUBSET_SIZE = 15
+FEATURE_VOTE_TOP_FRACTION = 0.25
 OUTPUT_COLUMNS = ["filename","patient_id","left_circumflex","right_coronary_artery","left_anterior_descending","occuluded_artery"]
 
 req_files = [
@@ -155,17 +162,18 @@ def export_probabilities():
 
     accuracy_rows = []
     bundles = []
-    if os.path.isdir(RESULTS_DIR):
-        for dirpath, _, filenames in os.walk(RESULTS_DIR):
-            for filename in filenames:
-                if filename != "final_model_f1_new_overlap.joblib":
-                    continue
-                model_name = os.path.basename(dirpath)
-                bundles.append((model_name, os.path.join(dirpath, filename)))
+    if os.path.isdir(MODEL_OUTPUTS_DIR):
+        for model_name in sorted(os.listdir(MODEL_OUTPUTS_DIR)):
+            model_dir = os.path.join(MODEL_OUTPUTS_DIR, model_name)
+            if not os.path.isdir(model_dir):
+                continue
+            bundle_path = os.path.join(model_dir, "final_model_f1_new_overlap.joblib")
+            if os.path.exists(bundle_path):
+                bundles.append((model_name, bundle_path))
 
     bundles.sort(key=lambda item: item[0])
     if not bundles:
-        print("ERROR: no model bundles found under results/")
+        print("ERROR: no model bundles found under results/model_outputs/")
         sys.exit(1)
 
     for model_name, bundle_path in bundles:
@@ -187,7 +195,7 @@ def export_probabilities():
                 int
             )
 
-            out_dir = os.path.join(RESULTS_DIR, model_name)
+            out_dir = os.path.join(MODEL_OUTPUTS_DIR, model_name)
             os.makedirs(out_dir, exist_ok=True)
             out_path = os.path.join(out_dir, f"probabilities_{split_name}.csv")
             output.to_csv(out_path, index=False)
@@ -330,9 +338,49 @@ def k_filter_voting_ensemble(probabilities, accuracy_path=ACCURACY_PATH, weight_
     return ensemble_probability, ensemble_pred, selected_models
 
 
+def stacking_logistic_ensemble(
+    validation_probabilities, validation_labels, split_probabilities
+):
+    validation_df = pd.DataFrame(validation_probabilities)
+    split_df = pd.DataFrame(split_probabilities)
+    if validation_df.empty or split_df.empty:
+        return pd.Series(dtype=float), pd.Series(dtype=int), [], PROBABILITY_THRESHOLD
+
+    common_models = [name for name in validation_df.columns if name in split_df.columns]
+    if not common_models:
+        return pd.Series(dtype=float), pd.Series(dtype=int), [], PROBABILITY_THRESHOLD
+
+    X_validation = validation_df[common_models].to_numpy(dtype=float)
+    X_split = split_df[common_models].to_numpy(dtype=float)
+    y_validation = np.asarray(validation_labels, dtype=int)
+    if len(y_validation) == 0:
+        return pd.Series(dtype=float), pd.Series(dtype=int), [], PROBABILITY_THRESHOLD
+
+    if len(np.unique(y_validation)) < 2:
+        split_probability = X_split.mean(axis=1)
+        split_pred = (split_probability >= PROBABILITY_THRESHOLD).astype(int)
+        return split_probability, split_pred, common_models, PROBABILITY_THRESHOLD
+
+    meta_model = LogisticRegression(max_iter=1000, solver="liblinear")
+    meta_model.fit(X_validation, y_validation)
+    validation_probability = meta_model.predict_proba(X_validation)[:, 1]
+
+    best_threshold = PROBABILITY_THRESHOLD
+    best_accuracy = ((validation_probability >= best_threshold) == y_validation).mean()
+    for threshold in np.linspace(0.30, 0.70, 41):
+        threshold_accuracy = ((validation_probability >= threshold) == y_validation).mean()
+        if threshold_accuracy > best_accuracy:
+            best_accuracy = threshold_accuracy
+            best_threshold = float(threshold)
+
+    split_probability = meta_model.predict_proba(X_split)[:, 1]
+    split_pred = (split_probability >= best_threshold).astype(int)
+    return split_probability, split_pred, common_models, best_threshold
+
+
 def run_ensemble_methods():
-    if not os.path.isdir(RESULTS_DIR):
-        print("ERROR: results/ directory not found; skipping ensembles.")
+    if not os.path.isdir(MODEL_OUTPUTS_DIR):
+        print("ERROR: results/model_outputs directory not found; skipping ensembles.")
         return
 
     os.makedirs(ENSEMBLES_DIR, exist_ok=True)
@@ -340,13 +388,47 @@ def run_ensemble_methods():
     summary_rows = []
     weights_used = {}
     selected_models = {}
+    stacking_info = {}
 
     model_dirs = [
         name
-        for name in os.listdir(RESULTS_DIR)
-        if os.path.isdir(os.path.join(RESULTS_DIR, name)) and name != "ensembles"
+        for name in os.listdir(MODEL_OUTPUTS_DIR)
+        if os.path.isdir(os.path.join(MODEL_OUTPUTS_DIR, name))
     ]
     model_dirs.sort()
+
+    validation_base_df = None
+    validation_keys = None
+    validation_probabilities = {}
+    for model_name in model_dirs:
+        validation_path = os.path.join(
+            MODEL_OUTPUTS_DIR, model_name, f"probabilities_{CALIBRATION_SPLIT}.csv"
+        )
+        if not os.path.exists(validation_path):
+            continue
+
+        validation_df = pd.read_csv(validation_path)
+        if (
+            not set(OUTPUT_COLUMNS).issubset(validation_df.columns)
+            or "mi_probability" not in validation_df.columns
+        ):
+            continue
+
+        validation_df = validation_df.sort_values(["patient_id", "filename"]).reset_index(drop=True)
+        if validation_base_df is None:
+            validation_base_df = validation_df[OUTPUT_COLUMNS].copy()
+            validation_keys = validation_base_df[["patient_id", "filename"]].copy().reset_index(drop=True)
+        else:
+            current_keys = validation_df[["patient_id", "filename"]].copy().reset_index(drop=True)
+            if not current_keys.equals(validation_keys):
+                continue
+
+        validation_probabilities[model_name] = validation_df["mi_probability"].to_numpy()
+
+    if validation_base_df is not None and validation_probabilities:
+        validation_labels = validation_base_df["occuluded_artery"].to_numpy(dtype=int)
+    else:
+        validation_labels = np.array([], dtype=int)
 
     for split_name, _ in DATASETS:
         base_df = None
@@ -354,7 +436,7 @@ def run_ensemble_methods():
         model_probabilities = {}
 
         for model_name in model_dirs:
-            prob_path = os.path.join(RESULTS_DIR, model_name, f"probabilities_{split_name}.csv")
+            prob_path = os.path.join(MODEL_OUTPUTS_DIR, model_name, f"probabilities_{split_name}.csv")
             if not os.path.exists(prob_path):
                 continue
 
@@ -391,6 +473,7 @@ def run_ensemble_methods():
             ("soft_voting", soft_voting_ensemble, {}),
             ("performance_weighted_soft", performance_weighted_soft_voting_ensemble, {"accuracy_path": ACCURACY_PATH, "weight_split": CALIBRATION_SPLIT}),
             ("k_filter_voting", k_filter_voting_ensemble, {"accuracy_path": ACCURACY_PATH, "weight_split": CALIBRATION_SPLIT, "k": TOP_K_MODELS}),
+            ("stacking_logistic", stacking_logistic_ensemble, {}),
         ]
 
         for method_name, method_fn, method_kwargs in methods:
@@ -402,6 +485,37 @@ def run_ensemble_methods():
                 ensemble_probability, ensemble_pred, selected = method_fn(model_probabilities, **method_kwargs)
                 selected_models[split_name] = selected
                 models_used = selected
+            elif method_name == "stacking_logistic":
+                if len(validation_probabilities) == 0 or len(validation_labels) == 0:
+                    print("WARNING: validation probabilities missing for stacking; using soft voting fallback.")
+                    ensemble_probability, ensemble_pred = soft_voting_ensemble(model_probabilities)
+                    models_used = list(model_probabilities.keys())
+                    stacking_info[split_name] = {
+                        "models_used": models_used,
+                        "threshold": PROBABILITY_THRESHOLD,
+                        "fallback": "soft_voting",
+                        "calibration_split": CALIBRATION_SPLIT,
+                    }
+                else:
+                    (
+                        ensemble_probability,
+                        ensemble_pred,
+                        models_used,
+                        best_threshold,
+                    ) = method_fn(validation_probabilities, validation_labels, model_probabilities)
+                    if len(models_used) == 0:
+                        ensemble_probability, ensemble_pred = soft_voting_ensemble(model_probabilities)
+                        models_used = list(model_probabilities.keys())
+                        best_threshold = PROBABILITY_THRESHOLD
+                        fallback = "soft_voting"
+                    else:
+                        fallback = None
+                    stacking_info[split_name] = {
+                        "models_used": models_used,
+                        "threshold": round(float(best_threshold), 4),
+                        "fallback": fallback,
+                        "calibration_split": CALIBRATION_SPLIT,
+                    }
             else:
                 ensemble_probability, ensemble_pred = method_fn(model_probabilities)
                 models_used = list(model_probabilities.keys())
@@ -441,6 +555,12 @@ def run_ensemble_methods():
         selected_path = os.path.join(ENSEMBLES_DIR, "k_filter_voting", "selected_models.json")
         with open(selected_path, "w") as handle:
             json.dump(selected_models, handle, indent=2)
+
+    if stacking_info:
+        stacking_path = os.path.join(ENSEMBLES_DIR, "stacking_logistic", "stacking_info.json")
+        os.makedirs(os.path.dirname(stacking_path), exist_ok=True)
+        with open(stacking_path, "w") as handle:
+            json.dump(stacking_info, handle, indent=2)
 
     print("Ensemble methods completed.")
 
@@ -495,20 +615,19 @@ def run_probability_calibration():
         return np.clip(calibrated, 0.0, 1.0)
 
     sources = []
-    for source_name in sorted(os.listdir(RESULTS_DIR)):
-        source_path = os.path.join(RESULTS_DIR, source_name)
-        if not os.path.isdir(source_path):
-            continue
-        if source_name in {"ensembles", "calibration"}:
-            continue
-        sources.append(
-            {
-                "source_type": "model",
-                "source_name": source_name,
-                "source_path": source_path,
-                "probability_column": "mi_probability",
-            }
-        )
+    if os.path.isdir(MODEL_OUTPUTS_DIR):
+        for source_name in sorted(os.listdir(MODEL_OUTPUTS_DIR)):
+            source_path = os.path.join(MODEL_OUTPUTS_DIR, source_name)
+            if not os.path.isdir(source_path):
+                continue
+            sources.append(
+                {
+                    "source_type": "model",
+                    "source_name": source_name,
+                    "source_path": source_path,
+                    "probability_column": "mi_probability",
+                }
+            )
 
     if os.path.isdir(ENSEMBLES_DIR):
         for source_name in sorted(os.listdir(ENSEMBLES_DIR)):
@@ -973,6 +1092,1789 @@ def run_abstain_uncertainty_logic():
         print("WARNING: no abstain and uncertainty outputs generated.")
 
 
+def run_feature_importance_analysis():
+    if not os.path.isdir(MODEL_OUTPUTS_DIR):
+        print("ERROR: results/model_outputs directory not found; skipping feature importance analysis.")
+        return
+
+    os.makedirs(FEATURE_IMPORTANCE_DIR, exist_ok=True)
+    if not os.path.exists(VALIDATION_PATH):
+        ensure_validation_split()
+    if not os.path.exists(VALIDATION_PATH):
+        print("ERROR: validation split missing; skipping feature importance analysis.")
+        return
+
+    validation_df = pd.read_csv(VALIDATION_PATH)
+    if "occuluded_artery" not in validation_df.columns:
+        print("ERROR: validation split missing occuluded_artery; skipping feature importance analysis.")
+        return
+
+    bundles = []
+    if os.path.isdir(MODEL_OUTPUTS_DIR):
+        for model_name in sorted(os.listdir(MODEL_OUTPUTS_DIR)):
+            model_dir = os.path.join(MODEL_OUTPUTS_DIR, model_name)
+            if not os.path.isdir(model_dir):
+                continue
+            bundle_path = os.path.join(model_dir, "final_model_f1_new_overlap.joblib")
+            if os.path.exists(bundle_path):
+                bundles.append((model_name, bundle_path))
+
+    bundles.sort(key=lambda item: item[0])
+    if not bundles:
+        print("ERROR: no model bundles found for feature importance analysis.")
+        return
+
+    accuracy_rows = []
+    if os.path.exists(ACCURACY_PATH):
+        with open(ACCURACY_PATH, "r") as handle:
+            accuracy_rows = json.load(handle)
+
+    validation_accuracy = {}
+    for row in accuracy_rows:
+        model_name = row.get("model")
+        split_name = row.get("split")
+        accuracy = row.get("accuracy_percent")
+        if model_name is None or accuracy is None:
+            continue
+        if split_name != CALIBRATION_SPLIT:
+            continue
+        validation_accuracy[model_name] = float(accuracy)
+
+    model_importance_maps = {}
+    model_rank_maps = {}
+    model_importance_source = {}
+    model_feature_sets = {}
+
+    def build_rank_map(features, scores):
+        ranking = sorted(
+            zip(features, scores),
+            key=lambda item: (-float(item[1]), item[0]),
+        )
+        rank_map = {}
+        for rank, (feature_name, _) in enumerate(ranking, start=1):
+            rank_map[feature_name] = rank
+        return rank_map
+
+    def normalize_importance(raw_importance):
+        values = np.asarray(raw_importance, dtype=float)
+        values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+        values = np.abs(values)
+        total = values.sum()
+        if total <= 0:
+            return np.ones_like(values) / len(values)
+        return values / total
+
+    def permutation_importance(bundle):
+        model = bundle["model"]
+        scaler = bundle["scaler"]
+        cols = bundle["cols"]
+        features = list(bundle["features"])
+        try:
+            X_scaled = scaler.transform(validation_df[cols])
+            X_scaled = pd.DataFrame(X_scaled, columns=cols, index=validation_df.index)
+            X_input = X_scaled[features].copy()
+            y_true = validation_df["occuluded_artery"].to_numpy(dtype=int)
+            baseline_probability = model.predict_proba(X_input)[:, 1]
+            baseline_probability = np.clip(baseline_probability, 1e-15, 1.0 - 1e-15)
+            baseline_loss = log_loss(y_true, baseline_probability, labels=[0, 1])
+
+            rng = np.random.default_rng(42)
+            importances = np.zeros(len(features), dtype=float)
+            for index, feature_name in enumerate(features):
+                X_permuted = X_input.copy()
+                X_permuted[feature_name] = rng.permutation(X_permuted[feature_name].to_numpy())
+                permuted_probability = model.predict_proba(X_permuted)[:, 1]
+                permuted_probability = np.clip(permuted_probability, 1e-15, 1.0 - 1e-15)
+                permuted_loss = log_loss(y_true, permuted_probability, labels=[0, 1])
+                importances[index] = max(permuted_loss - baseline_loss, 0.0)
+            return importances, "permutation_log_loss"
+        except Exception as exc:
+            print(f"WARNING: permutation importance failed; using uniform fallback. {exc}")
+            return np.ones(len(features), dtype=float), "uniform_fallback"
+
+    for model_name, bundle_path in bundles:
+        bundle = joblib.load(bundle_path)
+        model = bundle["model"]
+        features = list(bundle["features"])
+        raw_importance = None
+        importance_source = None
+
+        if hasattr(model, "feature_importances_"):
+            raw_importance = np.asarray(model.feature_importances_, dtype=float)
+            importance_source = "feature_importances_"
+        elif hasattr(model, "coef_"):
+            coef = np.asarray(model.coef_, dtype=float)
+            if coef.ndim == 1:
+                raw_importance = np.abs(coef)
+            else:
+                raw_importance = np.abs(coef).mean(axis=0)
+            importance_source = "coef_"
+        elif hasattr(model, "estimators_"):
+            tree_importances = []
+            for estimator in model.estimators_:
+                if hasattr(estimator, "feature_importances_"):
+                    estimator_importance = np.asarray(
+                        estimator.feature_importances_, dtype=float
+                    )
+                    if len(estimator_importance) == len(features):
+                        tree_importances.append(estimator_importance)
+            if tree_importances:
+                raw_importance = np.mean(tree_importances, axis=0)
+                importance_source = "estimators_feature_importances_"
+
+        if raw_importance is None or len(raw_importance) != len(features):
+            raw_importance, importance_source = permutation_importance(bundle)
+
+        normalized_importance = normalize_importance(raw_importance)
+        rank_map = build_rank_map(features, normalized_importance)
+
+        model_importance_source[model_name] = importance_source
+        model_feature_sets[model_name] = features
+        model_importance_maps[model_name] = dict(zip(features, normalized_importance))
+        model_rank_maps[model_name] = rank_map
+
+        model_out_dir = os.path.join(FEATURE_IMPORTANCE_DIR, "models", model_name)
+        os.makedirs(model_out_dir, exist_ok=True)
+        model_rows = []
+        for feature_name in features:
+            model_rows.append(
+                {
+                    "feature": feature_name,
+                    "importance": float(model_importance_maps[model_name][feature_name]),
+                    "rank": int(model_rank_maps[model_name][feature_name]),
+                    "importance_source": importance_source,
+                }
+            )
+        model_df = pd.DataFrame(model_rows).sort_values(
+            ["rank", "feature"], ascending=[True, True]
+        )
+        model_df.to_csv(os.path.join(model_out_dir, "feature_importance.csv"), index=False)
+
+    all_features = sorted(
+        {feature_name for features in model_feature_sets.values() for feature_name in features}
+    )
+    if not all_features:
+        print("ERROR: no features available for aggregation.")
+        return
+
+    n_features = len(all_features)
+    model_names = sorted(model_importance_maps.keys())
+    if not model_names:
+        print("ERROR: no model importances available for aggregation.")
+        return
+
+    complete_importance = {}
+    complete_rank = {}
+    for model_name in model_names:
+        importance_map = {}
+        rank_map = {}
+        for feature_name in all_features:
+            importance_map[feature_name] = float(
+                model_importance_maps[model_name].get(feature_name, 0.0)
+            )
+            rank_map[feature_name] = int(model_rank_maps[model_name].get(feature_name, n_features + 1))
+        complete_importance[model_name] = importance_map
+        complete_rank[model_name] = rank_map
+
+    raw_weights = {}
+    for model_name in model_names:
+        raw_weights[model_name] = validation_accuracy.get(model_name, 0.0)
+    weight_total = sum(raw_weights.values())
+    if weight_total <= 0:
+        normalized_weights = {name: 1.0 / len(model_names) for name in model_names}
+    else:
+        normalized_weights = {
+            name: raw_weights[name] / weight_total for name in model_names
+        }
+
+    ranked_by_accuracy = sorted(
+        model_names,
+        key=lambda name: (-raw_weights.get(name, 0.0), name),
+    )
+    top_k_models = ranked_by_accuracy[: min(TOP_K_MODELS, len(ranked_by_accuracy))]
+    vote_top_k = max(1, int(np.ceil(FEATURE_VOTE_TOP_FRACTION * n_features)))
+
+    aggregated_scores = {}
+    aggregated_metadata = {}
+
+    hard_scores = {}
+    for feature_name in all_features:
+        vote_count = sum(
+            1
+            for model_name in model_names
+            if complete_rank[model_name][feature_name] <= vote_top_k
+        )
+        hard_scores[feature_name] = vote_count / len(model_names)
+    aggregated_scores["hard_voting"] = hard_scores
+    aggregated_metadata["hard_voting"] = {
+        "models_used": model_names,
+        "vote_top_k": vote_top_k,
+    }
+
+    soft_scores = {}
+    for feature_name in all_features:
+        soft_scores[feature_name] = float(
+            np.mean([complete_importance[model_name][feature_name] for model_name in model_names])
+        )
+    aggregated_scores["soft_voting"] = soft_scores
+    aggregated_metadata["soft_voting"] = {
+        "models_used": model_names,
+    }
+
+    weighted_scores = {}
+    for feature_name in all_features:
+        weighted_scores[feature_name] = sum(
+            normalized_weights[model_name] * complete_importance[model_name][feature_name]
+            for model_name in model_names
+        )
+    aggregated_scores["performance_weighted_soft"] = weighted_scores
+    aggregated_metadata["performance_weighted_soft"] = {
+        "models_used": model_names,
+        "weights_used": normalized_weights,
+        "weight_split": CALIBRATION_SPLIT,
+    }
+
+    k_filter_scores = {}
+    for feature_name in all_features:
+        k_filter_scores[feature_name] = float(
+            np.mean(
+                [
+                    complete_importance[model_name][feature_name]
+                    for model_name in top_k_models
+                ]
+            )
+        )
+    aggregated_scores["k_filter_voting"] = k_filter_scores
+    aggregated_metadata["k_filter_voting"] = {
+        "models_used": top_k_models,
+        "k": TOP_K_MODELS,
+        "weight_split": CALIBRATION_SPLIT,
+    }
+
+    stacking_models = []
+    stacking_weights = {}
+    validation_probabilities = {}
+    validation_prob_keys = None
+    validation_prob_labels = None
+    for model_name in model_names:
+        validation_prob_path = os.path.join(
+            MODEL_OUTPUTS_DIR, model_name, f"probabilities_{CALIBRATION_SPLIT}.csv"
+        )
+        if not os.path.exists(validation_prob_path):
+            continue
+
+        validation_prob_df = pd.read_csv(validation_prob_path)
+        required_columns = {"patient_id", "filename", "occuluded_artery", "mi_probability"}
+        if not required_columns.issubset(validation_prob_df.columns):
+            continue
+
+        validation_prob_df = validation_prob_df.sort_values(
+            ["patient_id", "filename"]
+        ).reset_index(drop=True)
+        current_keys = validation_prob_df[["patient_id", "filename"]].copy().reset_index(drop=True)
+        if validation_prob_keys is None:
+            validation_prob_keys = current_keys
+            validation_prob_labels = validation_prob_df["occuluded_artery"].to_numpy(dtype=int)
+        elif not current_keys.equals(validation_prob_keys):
+            continue
+
+        validation_probabilities[model_name] = validation_prob_df["mi_probability"].to_numpy(dtype=float)
+
+    if validation_probabilities:
+        stacking_models = [name for name in model_names if name in validation_probabilities]
+
+    if stacking_models and validation_prob_labels is not None:
+        X_meta = np.column_stack([validation_probabilities[name] for name in stacking_models])
+        y_meta = np.asarray(validation_prob_labels, dtype=int)
+        if len(np.unique(y_meta)) >= 2:
+            stacker = LogisticRegression(max_iter=1000, solver="liblinear")
+            stacker.fit(X_meta, y_meta)
+            coef_values = np.abs(np.asarray(stacker.coef_, dtype=float).ravel())
+            coef_sum = float(coef_values.sum())
+            if coef_sum > 0:
+                stacking_weights = {
+                    name: float(weight / coef_sum)
+                    for name, weight in zip(stacking_models, coef_values)
+                }
+
+    if not stacking_weights:
+        if stacking_models:
+            stacking_weights = {
+                name: 1.0 / len(stacking_models) for name in stacking_models
+            }
+        else:
+            stacking_models = list(model_names)
+            stacking_weights = {
+                name: normalized_weights.get(name, 1.0 / len(model_names))
+                for name in stacking_models
+            }
+
+    stacking_scores = {}
+    for feature_name in all_features:
+        stacking_scores[feature_name] = sum(
+            stacking_weights[name] * complete_importance[name][feature_name]
+            for name in stacking_models
+        )
+    aggregated_scores["stacking_logistic"] = stacking_scores
+    aggregated_metadata["stacking_logistic"] = {
+        "models_used": stacking_models,
+        "weights_used": stacking_weights,
+        "weight_split": CALIBRATION_SPLIT,
+    }
+
+    rra_scores = {}
+    for feature_name in all_features:
+        rank_percentiles = np.array(
+            [
+                complete_rank[model_name][feature_name] / n_features
+                for model_name in model_names
+            ],
+            dtype=float,
+        )
+        rank_percentiles = np.clip(rank_percentiles, 1e-12, 1.0)
+        geometric_mean_rank = float(np.exp(np.mean(np.log(rank_percentiles))))
+        rra_scores[feature_name] = 1.0 - geometric_mean_rank
+    aggregated_scores["robust_rank_aggregation"] = rra_scores
+    aggregated_metadata["robust_rank_aggregation"] = {
+        "models_used": model_names,
+    }
+
+    mean_rank_scores = {}
+    for feature_name in all_features:
+        rank_percentiles = np.array(
+            [
+                complete_rank[model_name][feature_name] / n_features
+                for model_name in model_names
+            ],
+            dtype=float,
+        )
+        mean_rank_scores[feature_name] = 1.0 - float(np.mean(rank_percentiles))
+    aggregated_scores["mean_rank_aggregation"] = mean_rank_scores
+    aggregated_metadata["mean_rank_aggregation"] = {
+        "models_used": model_names,
+    }
+
+    aggregation_summary_rows = []
+    ranked_features_by_method = {}
+    for method_name, score_map in aggregated_scores.items():
+        method_dir = os.path.join(FEATURE_IMPORTANCE_DIR, "aggregated", method_name)
+        os.makedirs(method_dir, exist_ok=True)
+        ranking = sorted(
+            score_map.items(),
+            key=lambda item: (-float(item[1]), item[0]),
+        )
+        ranked_features_by_method[method_name] = [feature_name for feature_name, _ in ranking]
+
+        rows = []
+        for rank, (feature_name, score) in enumerate(ranking, start=1):
+            rows.append(
+                {
+                    "feature": feature_name,
+                    "score": float(score),
+                    "rank": int(rank),
+                }
+            )
+
+        pd.DataFrame(rows).to_csv(
+            os.path.join(method_dir, "feature_ranking.csv"), index=False
+        )
+        aggregation_summary_rows.append(
+            {
+                "method": method_name,
+                "n_features": n_features,
+                "metadata": aggregated_metadata[method_name],
+            }
+        )
+
+    aggregation_summary_path = os.path.join(
+        FEATURE_IMPORTANCE_DIR, "aggregation_summary.json"
+    )
+    with open(aggregation_summary_path, "w") as handle:
+        json.dump(aggregation_summary_rows, handle, indent=2)
+
+    def evaluate_subset_with_sweep(method_name, selected_features):
+        subset_eval_dir = os.path.join(
+            FEATURE_IMPORTANCE_DIR, "subset_evaluations", method_name
+        )
+        os.makedirs(subset_eval_dir, exist_ok=True)
+
+        selected_path = os.path.join(subset_eval_dir, "selected_features.txt")
+        with open(selected_path, "w") as handle:
+            handle.write("\n".join(selected_features))
+            handle.write("\n")
+
+        subset_summary_path = os.path.join(
+            subset_eval_dir, "subset_evaluation_summary.json"
+        )
+        if os.path.exists(subset_summary_path):
+            with open(subset_summary_path, "r") as handle:
+                cached_summary = json.load(handle)
+            cached_summary["status"] = "cached"
+            return cached_summary
+
+        workdir = os.path.join(subset_eval_dir, "workdir")
+        os.makedirs(workdir, exist_ok=True)
+        work_data_dir = os.path.join(workdir, "data")
+        work_cleaned_dir = os.path.join(work_data_dir, "cleaned")
+        os.makedirs(work_cleaned_dir, exist_ok=True)
+
+        linked_ood_dir = os.path.join(work_data_dir, "data_ood_id")
+        source_ood_dir = os.path.join(ROOT_DIR, "data", "data_ood_id")
+        if not os.path.exists(linked_ood_dir):
+            os.symlink(source_ood_dir, linked_ood_dir)
+
+        work_features_path = os.path.join(
+            work_cleaned_dir, "selected_features_f1_final_new_common_nate.txt"
+        )
+        with open(work_features_path, "w") as handle:
+            handle.write("\n".join(selected_features))
+            handle.write("\n")
+
+        sweep_script_path = os.path.join(workdir, "model_sweep.py")
+        shutil.copy2(MODEL_SWEEP_PATH, sweep_script_path)
+
+        sweep_env = os.environ.copy()
+        sweep_env["PYTHONWARNINGS"] = "ignore"
+        result = subprocess.run(
+            [sys.executable, sweep_script_path],
+            cwd=workdir,
+            env=sweep_env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if result.returncode != 0:
+            summary = {
+                "method": method_name,
+                "status": "failed",
+                "subset_size": len(selected_features),
+                "selected_features": selected_features,
+            }
+            with open(subset_summary_path, "w") as handle:
+                json.dump(summary, handle, indent=2)
+            return summary
+
+        model_results = []
+        local_results_dir = os.path.join(workdir, "results")
+        if os.path.isdir(local_results_dir):
+            for model_name in sorted(os.listdir(local_results_dir)):
+                model_dir = os.path.join(local_results_dir, model_name)
+                if not os.path.isdir(model_dir):
+                    continue
+                result_json_path = os.path.join(
+                    model_dir, "final_model_f1_new_overlap.json"
+                )
+                if not os.path.exists(result_json_path):
+                    continue
+                with open(result_json_path, "r") as handle:
+                    model_json = json.load(handle)
+                auc_test_1 = (
+                    model_json.get("test_1", {}).get("overall", {}).get("AUC")
+                )
+                auc_test_2 = (
+                    model_json.get("test_2", {}).get("overall", {}).get("AUC")
+                )
+                auc_test_3 = (
+                    model_json.get("test_3", {}).get("overall", {}).get("AUC")
+                )
+                model_results.append(
+                    {
+                        "model": model_name,
+                        "auc_test_set_ood_1": auc_test_1,
+                        "auc_test_set_ood_2": auc_test_2,
+                        "auc_test_set_id": auc_test_3,
+                    }
+                )
+
+        def safe_mean(values):
+            clean_values = [value for value in values if value is not None]
+            if not clean_values:
+                return None
+            return float(np.mean(clean_values))
+
+        summary = {
+            "method": method_name,
+            "status": "success",
+            "subset_size": len(selected_features),
+            "selected_features": selected_features,
+            "n_models_evaluated": len(model_results),
+            "mean_auc_test_set_ood_1": safe_mean(
+                [row["auc_test_set_ood_1"] for row in model_results]
+            ),
+            "mean_auc_test_set_ood_2": safe_mean(
+                [row["auc_test_set_ood_2"] for row in model_results]
+            ),
+            "mean_auc_test_set_id": safe_mean(
+                [row["auc_test_set_id"] for row in model_results]
+            ),
+            "model_results": model_results,
+        }
+        with open(subset_summary_path, "w") as handle:
+            json.dump(summary, handle, indent=2)
+        return summary
+
+    subset_summary_rows = []
+    subset_cache = {}
+    excluded_subset_features = {"age", "sex"}
+    for method_name in [
+        "hard_voting",
+        "soft_voting",
+        "performance_weighted_soft",
+        "k_filter_voting",
+        "stacking_logistic",
+        "robust_rank_aggregation",
+        "mean_rank_aggregation",
+    ]:
+        ranked_features = ranked_features_by_method.get(method_name, [])
+        subset_features = [
+            feature_name
+            for feature_name in ranked_features
+            if feature_name not in excluded_subset_features
+        ][:FEATURE_SUBSET_SIZE]
+
+        if not subset_features:
+            subset_summary_rows.append(
+                {
+                    "method": method_name,
+                    "status": "skipped",
+                    "reason": "no subset features available",
+                }
+            )
+            continue
+
+        subset_key = tuple(subset_features)
+        if subset_key in subset_cache:
+            cached_summary = dict(subset_cache[subset_key])
+            cached_summary["method"] = method_name
+            cached_summary["status"] = "reused_subset_result"
+            cached_summary["reused_from_method"] = subset_cache[subset_key]["method"]
+            summary = cached_summary
+        else:
+            summary = evaluate_subset_with_sweep(method_name, subset_features)
+            subset_cache[subset_key] = dict(summary)
+        subset_summary_rows.append(summary)
+
+    subset_summary_path = os.path.join(
+        FEATURE_IMPORTANCE_DIR, "subset_evaluation_summary.json"
+    )
+    with open(subset_summary_path, "w") as handle:
+        json.dump(subset_summary_rows, handle, indent=2)
+
+    model_importance_metadata = []
+    for model_name in model_names:
+        model_importance_metadata.append(
+            {
+                "model": model_name,
+                "importance_source": model_importance_source[model_name],
+                "n_features": len(model_feature_sets[model_name]),
+            }
+        )
+    model_importance_metadata_path = os.path.join(
+        FEATURE_IMPORTANCE_DIR, "model_importance_summary.json"
+    )
+    with open(model_importance_metadata_path, "w") as handle:
+        json.dump(model_importance_metadata, handle, indent=2)
+
+    lead_names = [
+        "I",
+        "II",
+        "III",
+        "aVR",
+        "aVL",
+        "aVF",
+        "V1",
+        "V2",
+        "V3",
+        "V4",
+        "V5",
+        "V6",
+    ]
+    feature_definition_rows = []
+    for feature_name in all_features:
+        definition = "Custom feature"
+        if feature_name == "age":
+            definition = "Patient age"
+        elif feature_name == "sex":
+            definition = "Patient sex"
+        elif feature_name.startswith("feature_"):
+            try:
+                feature_index = int(feature_name.split("_")[1])
+            except (IndexError, ValueError):
+                feature_index = None
+            if feature_index is not None:
+                if 1 <= feature_index <= 12:
+                    lead = lead_names[feature_index - 1]
+                    definition = f"Mean amplitude ({lead})"
+                elif 13 <= feature_index <= 24:
+                    lead = lead_names[feature_index - 13]
+                    definition = f"Std amplitude ({lead})"
+                elif feature_index == 25:
+                    definition = "Mean absolute amplitude (all leads)"
+                elif feature_index == 26:
+                    definition = "Std absolute amplitude (all leads)"
+                elif feature_index == 27:
+                    definition = "Max absolute amplitude (all leads)"
+                elif feature_index == 28:
+                    definition = "RMS amplitude (all leads)"
+                elif feature_index == 29:
+                    definition = "Mean peak-to-peak (all leads)"
+                elif feature_index == 30:
+                    definition = "Std peak-to-peak (all leads)"
+
+        feature_definition_rows.append(
+            {"feature": feature_name, "definition": definition}
+        )
+
+    feature_definition_df = pd.DataFrame(feature_definition_rows).sort_values("feature")
+    feature_definition_df.to_csv(
+        os.path.join(FEATURE_IMPORTANCE_DIR, "feature_definitions.csv"),
+        index=False,
+    )
+
+    print("Feature importance analysis completed.")
+
+
+def run_final_summary_plots():
+    if not os.path.isdir(RESULTS_DIR):
+        print("ERROR: results directory not found; skipping final plots.")
+        return
+
+    os.makedirs(FINAL_PLOTS_DIR, exist_ok=True)
+
+    plt.style.use("seaborn-v0_8-whitegrid")
+
+    single_model_accuracy_df = None
+    best_single_accuracy_by_split = {}
+    best_single_model_name = None
+    best_single_model_mean_auc = None
+    model_auc_rows = []
+    ensemble_df_for_summary = None
+    feature_label_map = {}
+    feature_definition_path = os.path.join(
+        FEATURE_IMPORTANCE_DIR, "feature_definitions.csv"
+    )
+    if os.path.exists(feature_definition_path):
+        try:
+            feature_definition_df = pd.read_csv(feature_definition_path)
+            if {"feature", "definition"}.issubset(feature_definition_df.columns):
+                for row in feature_definition_df.itertuples(index=False):
+                    feature_label_map[str(row.feature)] = str(row.definition)
+        except Exception:
+            feature_label_map = {}
+
+    def format_feature_label(feature_name):
+        feature_name = str(feature_name)
+        definition = feature_label_map.get(feature_name)
+        if definition is None or definition == "Custom feature":
+            return feature_name
+        return f"{feature_name} - {definition}"
+
+    if os.path.exists(ACCURACY_PATH):
+        with open(ACCURACY_PATH, "r") as handle:
+            single_model_rows = json.load(handle)
+        if single_model_rows:
+            single_model_accuracy_df = pd.DataFrame(single_model_rows)
+            for split_name in ["test_set_ood_1", "test_set_ood_2", "test_set_id"]:
+                split_df = single_model_accuracy_df[
+                    single_model_accuracy_df["split"] == split_name
+                ]
+                if not split_df.empty:
+                    best_single_accuracy_by_split[split_name] = float(
+                        split_df["accuracy_percent"].max()
+                    )
+
+    if os.path.isdir(MODEL_OUTPUTS_DIR):
+        model_names_for_summary = sorted(os.listdir(MODEL_OUTPUTS_DIR))
+    else:
+        model_names_for_summary = []
+
+    for model_name in model_names_for_summary:
+        model_dir = os.path.join(MODEL_OUTPUTS_DIR, model_name)
+        if not os.path.isdir(model_dir):
+            continue
+        metrics_path = os.path.join(model_dir, "final_model_f1_new_overlap.json")
+        if not os.path.exists(metrics_path):
+            continue
+        with open(metrics_path, "r") as handle:
+            model_metrics = json.load(handle)
+        auc_values = [
+            model_metrics.get("test_1", {}).get("overall", {}).get("AUC"),
+            model_metrics.get("test_2", {}).get("overall", {}).get("AUC"),
+            model_metrics.get("test_3", {}).get("overall", {}).get("AUC"),
+        ]
+        auc_values = [value for value in auc_values if value is not None]
+        if not auc_values:
+            continue
+        model_mean_auc = float(np.mean(auc_values))
+        model_auc_rows.append({"model": model_name, "mean_auc": model_mean_auc})
+
+    if model_auc_rows:
+        model_auc_rows = sorted(
+            model_auc_rows, key=lambda row: (-row["mean_auc"], row["model"])
+        )
+        best_single_model_name = model_auc_rows[0]["model"]
+        best_single_model_mean_auc = model_auc_rows[0]["mean_auc"]
+
+    ensemble_summary_path = os.path.join(ENSEMBLES_DIR, "ensemble_accuracy_summary.json")
+    if os.path.exists(ensemble_summary_path):
+        with open(ensemble_summary_path, "r") as handle:
+            ensemble_rows = json.load(handle)
+
+        if ensemble_rows:
+            ensemble_df = pd.DataFrame(ensemble_rows)
+            ensemble_df = ensemble_df[
+                ensemble_df["split"].isin(["test_set_ood_1", "test_set_ood_2", "test_set_id"])
+            ].copy()
+            ensemble_df_for_summary = ensemble_df.copy()
+            if not ensemble_df.empty:
+                method_order = (
+                    ensemble_df.groupby("method")["accuracy_percent"]
+                    .mean()
+                    .sort_values(ascending=False)
+                    .index.tolist()
+                )
+                split_order = ["test_set_ood_1", "test_set_ood_2", "test_set_id"]
+                category_order = list(method_order)
+                if len(best_single_accuracy_by_split) == len(split_order):
+                    category_order.append("best_single_model")
+
+                bar_width = 0.22
+                x = np.arange(len(category_order))
+                colors = ["#4C72B0", "#55A868", "#C44E52"]
+                split_display = {
+                    "test_set_ood_1": "OOD-1",
+                    "test_set_ood_2": "OOD-2",
+                    "test_set_id": "ID",
+                }
+                method_display = {
+                    "hard_voting": "Hard",
+                    "soft_voting": "Soft",
+                    "performance_weighted_soft": "Weighted",
+                    "k_filter_voting": "Top-K",
+                    "stacking_logistic": "Stacking LR",
+                    "best_single_model": "Best Single",
+                }
+
+                plt.figure(figsize=(16, 7.6))
+                for index, split_name in enumerate(split_order):
+                    split_values = []
+                    for category_name in category_order:
+                        if category_name == "best_single_model":
+                            split_values.append(best_single_accuracy_by_split.get(split_name, np.nan))
+                            continue
+                        match = ensemble_df[
+                            (ensemble_df["method"] == category_name)
+                            & (ensemble_df["split"] == split_name)
+                        ]
+                        split_values.append(float(match["accuracy_percent"].iloc[0]) if not match.empty else np.nan)
+                    positions = x + (index - 1) * bar_width
+                    bars = plt.bar(
+                        positions,
+                        split_values,
+                        width=bar_width,
+                        label=split_display.get(split_name, split_name),
+                        color=colors[index],
+                        alpha=0.9,
+                    )
+                    for bar, value in zip(bars, split_values):
+                        if np.isnan(value):
+                            continue
+                        label_y = value - 1.8 if value >= 8 else value + 0.2
+                        label_va = "top" if value >= 8 else "bottom"
+                        label_color = "white" if value >= 8 else "black"
+                        plt.text(
+                            bar.get_x() + bar.get_width() / 2.0,
+                            label_y,
+                            f"{value:.1f}",
+                            ha="center",
+                            va=label_va,
+                            fontsize=7,
+                            color=label_color,
+                        )
+
+                if "best_single_model" in category_order:
+                    divider_index = category_order.index("best_single_model") - 0.5
+                    plt.axvline(divider_index, color="#666666", linestyle="--", linewidth=1.0)
+
+                method_labels = [method_display.get(name, name) for name in category_order]
+                plt.xticks(x, method_labels, rotation=0, ha="center")
+                plt.ylabel("Accuracy (%)")
+                plt.title("Ensemble Accuracy Comparison (higher is better)")
+                plt.legend(
+                    title="Split",
+                    loc="upper center",
+                    bbox_to_anchor=(0.5, 1.14),
+                    ncol=3,
+                    frameon=False,
+                )
+                plt.figtext(
+                    0.5,
+                    0.01,
+                    "Split key: OOD-1/OOD-2 = out-of-distribution test sets, ID = in-distribution test set.",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                )
+                plt.ylim(0.0, 102.0)
+                plt.tight_layout(rect=[0, 0.05, 1, 0.91])
+                plt.savefig(
+                    os.path.join(FINAL_PLOTS_DIR, "ensemble_methods_bar.png"),
+                    dpi=180,
+                )
+                plt.close()
+            else:
+                print("WARNING: no ensemble test rows available for final ensemble plot.")
+        else:
+            print("WARNING: ensemble summary is empty; skipping ensemble plot.")
+    else:
+        print("WARNING: ensemble summary file missing; skipping ensemble plot.")
+
+    abstain_summary_path = os.path.join(ABSTAIN_DIR, "abstain_uncertainty_summary.json")
+    if os.path.exists(abstain_summary_path):
+        with open(abstain_summary_path, "r") as handle:
+            abstain_rows = json.load(handle)
+
+        if abstain_rows:
+            abstain_df = pd.DataFrame(abstain_rows)
+            split_order = [split_name for split_name, _ in DATASETS]
+            abstain_df["split"] = pd.Categorical(
+                abstain_df["split"], categories=split_order, ordered=True
+            )
+            abstain_df = abstain_df.sort_values("split")
+
+            x = np.arange(len(abstain_df))
+            split_display = {
+                "validation": "Validation",
+                "test_set_ood_1": "OOD-1",
+                "test_set_ood_2": "OOD-2",
+                "test_set_id": "ID",
+            }
+            threshold_text = None
+            thresholds_path = os.path.join(ABSTAIN_DIR, "thresholds_used.json")
+            if os.path.exists(thresholds_path):
+                with open(thresholds_path, "r") as handle:
+                    thresholds_data = json.load(handle)
+                threshold_text = (
+                    f"Method={thresholds_data.get('ensemble_method', 'NA')}, "
+                    f"conf>={thresholds_data.get('confidence_threshold', 'NA')}, "
+                    f"disagree<={thresholds_data.get('disagreement_threshold', 'NA')}"
+                )
+
+            coverage = abstain_df["coverage_percent"].astype(float).to_numpy()
+            covered_accuracy = abstain_df["covered_accuracy_percent"].astype(float).to_numpy()
+            not_sure = abstain_df["abstain_percent"].astype(float).to_numpy()
+            auto_correct = (coverage * covered_accuracy) / 100.0
+            auto_incorrect = np.maximum(coverage - auto_correct, 0.0)
+            fig, axes = plt.subplots(
+                2,
+                1,
+                figsize=(12, 8.6),
+                sharex=True,
+                gridspec_kw={"height_ratios": [2.0, 1.35]},
+            )
+            ax_outcome, ax_metrics = axes
+
+            bars_correct = ax_outcome.bar(
+                x,
+                auto_correct,
+                width=0.58,
+                label="Auto Correct",
+                color="#55A868",
+                alpha=0.95,
+            )
+            bars_incorrect = ax_outcome.bar(
+                x,
+                auto_incorrect,
+                width=0.58,
+                bottom=auto_correct,
+                label="Auto Incorrect",
+                color="#C44E52",
+                alpha=0.95,
+            )
+            bars_not_sure = ax_outcome.bar(
+                x,
+                not_sure,
+                width=0.58,
+                bottom=auto_correct + auto_incorrect,
+                label="Not Sure",
+                color="#8C8C8C",
+                alpha=0.95,
+            )
+
+            for bars in [bars_correct, bars_incorrect, bars_not_sure]:
+                for bar in bars:
+                    height = bar.get_height()
+                    if height < 7.0:
+                        continue
+                    y_center = bar.get_y() + (height / 2.0)
+                    ax_outcome.text(
+                        bar.get_x() + bar.get_width() / 2.0,
+                        y_center,
+                        f"{height:.1f}%",
+                        ha="center",
+                        va="center",
+                        fontsize=8,
+                        color="white",
+                    )
+
+            ax_outcome.set_ylabel("All cases (%)")
+            ax_outcome.set_ylim(0.0, 100.0)
+            ax_outcome.legend(
+                loc="upper center",
+                bbox_to_anchor=(0.5, 1.15),
+                ncol=3,
+                frameon=False,
+            )
+            ax_outcome.set_title("Abstain / Uncertainty Outcomes by Split")
+
+            bar_width = 0.34
+            coverage_bars = ax_metrics.bar(
+                x - (bar_width / 2.0),
+                coverage,
+                width=bar_width,
+                label="Coverage (auto yes/no %)",
+                color="#4C72B0",
+                alpha=0.9,
+            )
+            covered_acc_bars = ax_metrics.bar(
+                x + (bar_width / 2.0),
+                covered_accuracy,
+                width=bar_width,
+                label="Covered Accuracy (%)",
+                color="#E17C05",
+                alpha=0.9,
+            )
+            for bars in [coverage_bars, covered_acc_bars]:
+                for bar in bars:
+                    value = bar.get_height()
+                    ax_metrics.text(
+                        bar.get_x() + bar.get_width() / 2.0,
+                        value + 1.0,
+                        f"{value:.1f}",
+                        ha="center",
+                        va="bottom",
+                        fontsize=8,
+                    )
+
+            ax_metrics.set_ylabel("Percent (%)")
+            ax_metrics.set_ylim(0.0, 100.0)
+            ax_metrics.legend(
+                loc="upper center",
+                bbox_to_anchor=(0.5, 1.18),
+                ncol=2,
+                frameon=False,
+            )
+            x_labels = [split_display.get(value, value) for value in abstain_df["split"].tolist()]
+            ax_metrics.set_xticks(x)
+            ax_metrics.set_xticklabels(x_labels, rotation=0, ha="center")
+            ax_metrics.set_xlabel("Dataset split")
+
+            info_lines = [
+                "Coverage = % of cases where model gives auto yes/no",
+                "Covered accuracy = accuracy only within those covered cases",
+                "Not sure = % abstained",
+                "Split key: OOD-1/OOD-2 = out-of-distribution test sets, ID = in-distribution test set.",
+            ]
+            if threshold_text is not None:
+                info_lines.append(threshold_text)
+            fig.text(0.5, 0.01, "\n".join(info_lines), ha="center", va="bottom", fontsize=8)
+
+            fig.tight_layout(rect=[0, 0.14, 1, 0.95])
+            fig.savefig(
+                os.path.join(FINAL_PLOTS_DIR, "abstain_uncertainty_bar.png"),
+                dpi=180,
+            )
+            plt.close(fig)
+        else:
+            print("WARNING: abstain summary is empty; skipping abstain plot.")
+    else:
+        print("WARNING: abstain summary file missing; skipping abstain plot.")
+
+    subset_summary_path = os.path.join(
+        FEATURE_IMPORTANCE_DIR, "subset_evaluation_summary.json"
+    )
+    if os.path.exists(subset_summary_path):
+        with open(subset_summary_path, "r") as handle:
+            subset_rows = json.load(handle)
+
+        subset_df = pd.DataFrame(subset_rows)
+        if not subset_df.empty:
+            valid_mask = subset_df["status"].isin(
+                ["success", "cached", "reused_subset_result"]
+            )
+            valid_df = subset_df[valid_mask].copy()
+            if not valid_df.empty:
+                valid_df["overall_auc"] = valid_df[
+                    ["mean_auc_test_set_ood_1", "mean_auc_test_set_ood_2", "mean_auc_test_set_id"]
+                ].mean(axis=1, skipna=True)
+                valid_df = valid_df.sort_values("overall_auc", ascending=False)
+
+                values = valid_df["overall_auc"].astype(float).to_numpy()
+                colors = ["#4C72B0" if index == 0 else "#8AA8D6" for index in range(len(values))]
+                method_display = {
+                    "hard_voting": "Hard Voting",
+                    "soft_voting": "Soft Voting",
+                    "performance_weighted_soft": "Weighted Soft",
+                    "k_filter_voting": "Top-K Voting",
+                    "stacking_logistic": "Stacking (LR)",
+                    "robust_rank_aggregation": "RRA",
+                    "mean_rank_aggregation": "Mean Rank",
+                }
+                method_labels = [
+                    method_display.get(value, value) for value in valid_df["method"].tolist()
+                ]
+
+                fig, ax = plt.subplots(figsize=(12, 6.8))
+                y = np.arange(len(method_labels))
+                bars = ax.barh(y, values, color=colors, alpha=0.95)
+                ax.set_yticks(y)
+                ax.set_yticklabels(method_labels)
+                ax.invert_yaxis()
+
+                baseline_value = None
+                if best_single_model_mean_auc is not None:
+                    baseline_value = float(best_single_model_mean_auc)
+                    baseline_label = (
+                        f"Single-best full model AUC ({best_single_model_name}) = "
+                        f"{baseline_value:.3f}"
+                    )
+                    ax.axvline(
+                        baseline_value,
+                        color="#C44E52",
+                        linestyle="--",
+                        linewidth=1.4,
+                        label=baseline_label,
+                    )
+
+                x_max = float(np.nanmax(values))
+                if baseline_value is not None:
+                    x_max = max(x_max, baseline_value)
+                x_max = min(1.0, x_max + 0.12)
+                ax.set_xlim(0.0, x_max)
+
+                for index, (bar, value) in enumerate(zip(bars, values)):
+                    text_x = min(value + 0.008, x_max - 0.01)
+                    delta_text = ""
+                    if baseline_value is not None:
+                        delta_text = f" ({value - baseline_value:+.3f} vs baseline)"
+                    ax.text(
+                        text_x,
+                        index,
+                        f"{value:.3f}{delta_text}",
+                        ha="left",
+                        va="center",
+                        fontsize=8,
+                    )
+
+                ax.set_xlabel("Mean AUC across OOD-1, OOD-2, and ID")
+                ax.set_title("Feature Aggregation Methods: Subset Evaluation Quality")
+                if baseline_value is not None:
+                    ax.legend(loc="lower right", frameon=False)
+
+                fig.text(
+                    0.5,
+                    0.01,
+                    (
+                        f"Evaluation logic: each method ranks features -> top {FEATURE_SUBSET_SIZE} are selected -> "
+                        "model_sweep is rerun on that subset -> mean AUC is reported. "
+                        "Split key: OOD-1/OOD-2 = out-of-distribution, ID = in-distribution."
+                    ),
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                )
+                fig.tight_layout(rect=[0, 0.07, 1, 0.98])
+                fig.savefig(
+                    os.path.join(FINAL_PLOTS_DIR, "feature_importance_methods_bar.png"),
+                    dpi=180,
+                )
+                plt.close(fig)
+            else:
+                placeholder_methods = subset_df["method"].astype(str).tolist()
+                if not placeholder_methods:
+                    placeholder_methods = [
+                        "hard_voting",
+                        "soft_voting",
+                        "performance_weighted_soft",
+                        "k_filter_voting",
+                        "stacking_logistic",
+                        "robust_rank_aggregation",
+                        "mean_rank_aggregation",
+                    ]
+                method_display = {
+                    "hard_voting": "Hard Voting",
+                    "soft_voting": "Soft Voting",
+                    "performance_weighted_soft": "Weighted Soft",
+                    "k_filter_voting": "Top-K Voting",
+                    "stacking_logistic": "Stacking (LR)",
+                    "robust_rank_aggregation": "RRA",
+                    "mean_rank_aggregation": "Mean Rank",
+                }
+                x = np.arange(len(placeholder_methods))
+                values = np.zeros(len(placeholder_methods), dtype=float)
+                plt.figure(figsize=(10, 5))
+                bars = plt.bar(x, values, color="#A0A0A0", alpha=0.9)
+                for bar in bars:
+                    plt.text(
+                        bar.get_x() + bar.get_width() / 2.0,
+                        0.01,
+                        "NA",
+                        ha="center",
+                        va="bottom",
+                        fontsize=8,
+                    )
+                placeholder_labels = [
+                    method_display.get(value, value) for value in placeholder_methods
+                ]
+                plt.xticks(x, placeholder_labels, rotation=15, ha="right")
+                plt.ylabel("Mean AUC across test splits")
+                plt.title("Feature Importance Method Comparison (Awaiting Subset Evaluation)")
+                plt.ylim(0.0, 1.0)
+                plt.tight_layout()
+                plt.savefig(
+                    os.path.join(FINAL_PLOTS_DIR, "feature_importance_methods_bar.png"),
+                    dpi=180,
+                )
+                plt.close()
+                print("WARNING: subset evaluations not available; generated placeholder feature method plot.")
+        else:
+            placeholder_methods = [
+                "hard_voting",
+                "soft_voting",
+                "performance_weighted_soft",
+                "k_filter_voting",
+                "stacking_logistic",
+                "robust_rank_aggregation",
+                "mean_rank_aggregation",
+            ]
+            method_display = {
+                "hard_voting": "Hard Voting",
+                "soft_voting": "Soft Voting",
+                "performance_weighted_soft": "Weighted Soft",
+                "k_filter_voting": "Top-K Voting",
+                "stacking_logistic": "Stacking (LR)",
+                "robust_rank_aggregation": "RRA",
+                "mean_rank_aggregation": "Mean Rank",
+            }
+            x = np.arange(len(placeholder_methods))
+            values = np.zeros(len(placeholder_methods), dtype=float)
+            plt.figure(figsize=(10, 5))
+            bars = plt.bar(x, values, color="#A0A0A0", alpha=0.9)
+            for bar in bars:
+                plt.text(
+                    bar.get_x() + bar.get_width() / 2.0,
+                    0.01,
+                    "NA",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                )
+            placeholder_labels = [
+                method_display.get(value, value) for value in placeholder_methods
+            ]
+            plt.xticks(x, placeholder_labels, rotation=15, ha="right")
+            plt.ylabel("Mean AUC across test splits")
+            plt.title("Feature Importance Method Comparison (Awaiting Subset Evaluation)")
+            plt.ylim(0.0, 1.0)
+            plt.tight_layout()
+            plt.savefig(
+                os.path.join(FINAL_PLOTS_DIR, "feature_importance_methods_bar.png"),
+                dpi=180,
+            )
+            plt.close()
+            print("WARNING: subset summary is empty; generated placeholder feature method plot.")
+    else:
+        placeholder_methods = [
+            "hard_voting",
+            "soft_voting",
+            "performance_weighted_soft",
+            "k_filter_voting",
+            "stacking_logistic",
+            "robust_rank_aggregation",
+            "mean_rank_aggregation",
+        ]
+        method_display = {
+            "hard_voting": "Hard Voting",
+            "soft_voting": "Soft Voting",
+            "performance_weighted_soft": "Weighted Soft",
+            "k_filter_voting": "Top-K Voting",
+            "stacking_logistic": "Stacking (LR)",
+            "robust_rank_aggregation": "RRA",
+            "mean_rank_aggregation": "Mean Rank",
+        }
+        x = np.arange(len(placeholder_methods))
+        values = np.zeros(len(placeholder_methods), dtype=float)
+        plt.figure(figsize=(10, 5))
+        bars = plt.bar(x, values, color="#A0A0A0", alpha=0.9)
+        for bar in bars:
+            plt.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                0.01,
+                "NA",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+        placeholder_labels = [
+            method_display.get(value, value) for value in placeholder_methods
+        ]
+        plt.xticks(x, placeholder_labels, rotation=15, ha="right")
+        plt.ylabel("Mean AUC across test splits")
+        plt.title("Feature Importance Method Comparison (Awaiting Subset Evaluation)")
+        plt.ylim(0.0, 1.0)
+        plt.tight_layout()
+        plt.savefig(
+            os.path.join(FINAL_PLOTS_DIR, "feature_importance_methods_bar.png"),
+            dpi=180,
+        )
+        plt.close()
+        print("WARNING: subset evaluation summary missing; generated placeholder feature method plot.")
+
+    if single_model_accuracy_df is not None and ensemble_df_for_summary is not None:
+        split_filter = ["test_set_ood_1", "test_set_ood_2", "test_set_id"]
+        before_df = single_model_accuracy_df[
+            single_model_accuracy_df["split"].isin(split_filter)
+        ].copy()
+        after_df = ensemble_df_for_summary[
+            ensemble_df_for_summary["split"].isin(split_filter)
+        ].copy()
+
+        if not before_df.empty and not after_df.empty:
+            method_display = {
+                "hard_voting": "Hard Voting",
+                "soft_voting": "Soft Voting",
+                "performance_weighted_soft": "Weighted Soft",
+                "k_filter_voting": "Top-K Voting",
+                "stacking_logistic": "Stacking (LR)",
+            }
+
+            split_order = ["test_set_ood_1", "test_set_ood_2", "test_set_id"]
+            split_display = {
+                "test_set_ood_1": "OOD-1",
+                "test_set_ood_2": "OOD-2",
+                "test_set_id": "ID",
+            }
+
+            labels = []
+            before_values = []
+            after_values = []
+
+            for split_name in split_order:
+                split_before_df = before_df[before_df["split"] == split_name]
+                split_after_df = after_df[after_df["split"] == split_name]
+                if split_before_df.empty or split_after_df.empty:
+                    continue
+
+                best_before_row = split_before_df.loc[
+                    split_before_df["accuracy_percent"].idxmax()
+                ]
+                best_after_row = split_after_df.loc[
+                    split_after_df["accuracy_percent"].idxmax()
+                ]
+                before_model_name = str(best_before_row["model"])
+                after_method_name = method_display.get(
+                    str(best_after_row["method"]), str(best_after_row["method"])
+                )
+                labels.append(split_display.get(split_name, split_name))
+                before_values.append(float(best_before_row["accuracy_percent"]))
+                after_values.append(float(best_after_row["accuracy_percent"]))
+
+            generated_before_after_plot = False
+            if labels:
+                labels.append("Mean\nAcross Splits")
+                before_values.append(float(np.mean(before_values)))
+                after_values.append(float(np.mean(after_values)))
+
+                x = np.arange(len(labels))
+                width = 0.36
+                plt.figure(figsize=(13, 6.2))
+                bars_before = plt.bar(
+                    x - (width / 2.0),
+                    before_values,
+                    width=width,
+                    color="#4C72B0",
+                    alpha=0.94,
+                    label="Best Single Model",
+                )
+                bars_after = plt.bar(
+                    x + (width / 2.0),
+                    after_values,
+                    width=width,
+                    color="#55A868",
+                    alpha=0.94,
+                    label="Best Ensemble Method",
+                )
+
+                for bars, values in [(bars_before, before_values), (bars_after, after_values)]:
+                    for bar, value in zip(bars, values):
+                        plt.text(
+                            bar.get_x() + bar.get_width() / 2.0,
+                            value + 0.2,
+                            f"{value:.1f}",
+                            ha="center",
+                            va="bottom",
+                            fontsize=8,
+                        )
+
+                for index, (before_value, after_value) in enumerate(
+                    zip(before_values, after_values)
+                ):
+                    delta = after_value - before_value
+                    delta_color = "#2E8B57" if delta >= 0 else "#B22222"
+                    plt.text(
+                        x[index],
+                        max(before_value, after_value) + 1.0,
+                        f"Delta {delta:+.1f}%",
+                        ha="center",
+                        va="bottom",
+                        fontsize=9,
+                        color=delta_color,
+                        fontweight="bold",
+                    )
+
+                plt.xticks(x, labels, rotation=0, ha="center")
+                plt.ylabel("Accuracy (%)")
+                plt.title("Best Single Model vs Best Ensemble (Per Split)")
+                plt.legend(loc="upper left", frameon=False)
+                y_max = max(before_values + after_values)
+                plt.ylim(0.0, max(100.0, y_max + 4.0))
+                plt.figtext(
+                    0.5,
+                    0.01,
+                    "Split key: OOD-1/OOD-2 = out-of-distribution test sets, ID = in-distribution test set.",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                )
+                plt.tight_layout(rect=[0, 0.05, 1, 0.98])
+                generated_before_after_plot = True
+            else:
+                print("WARNING: no overlapping split data for before/after ensemble chart.")
+
+            if generated_before_after_plot:
+                plt.savefig(
+                    os.path.join(FINAL_PLOTS_DIR, "before_after_ensemble_accuracy_bar.png"),
+                    dpi=180,
+                )
+                plt.close()
+        else:
+            print("WARNING: missing data for before/after ensemble chart.")
+    else:
+        print("WARNING: accuracy summaries missing; skipping before/after ensemble chart.")
+
+    if single_model_accuracy_df is not None:
+        split_filter = ["test_set_ood_1", "test_set_ood_2", "test_set_id"]
+        split_display = {
+            "test_set_ood_1": "OOD-1",
+            "test_set_ood_2": "OOD-2",
+            "test_set_id": "ID",
+        }
+        single_test_df = single_model_accuracy_df[
+            single_model_accuracy_df["split"].isin(split_filter)
+        ].copy()
+        if not single_test_df.empty:
+            mean_accuracy_df = (
+                single_test_df.groupby("model", as_index=False)["accuracy_percent"]
+                .mean()
+                .sort_values(["accuracy_percent", "model"], ascending=[False, True])
+            )
+            best_accuracy_model = str(mean_accuracy_df.iloc[0]["model"])
+            best_model_df = single_test_df[
+                single_test_df["model"] == best_accuracy_model
+            ].copy()
+
+            x_labels = []
+            values = []
+            for split_name in split_filter:
+                split_rows = best_model_df[best_model_df["split"] == split_name]
+                if split_rows.empty:
+                    continue
+                x_labels.append(split_display.get(split_name, split_name))
+                values.append(float(split_rows.iloc[0]["accuracy_percent"]))
+
+            if values:
+                mean_value = float(np.mean(values))
+                x = np.arange(len(values))
+                plt.figure(figsize=(8, 5))
+                bars = plt.bar(x, values, color="#4C72B0", alpha=0.94)
+                for bar, value in zip(bars, values):
+                    plt.text(
+                        bar.get_x() + bar.get_width() / 2.0,
+                        value + 0.2,
+                        f"{value:.1f}",
+                        ha="center",
+                        va="bottom",
+                        fontsize=9,
+                    )
+                plt.axhline(
+                    mean_value,
+                    color="#C44E52",
+                    linestyle="--",
+                    linewidth=1.4,
+                    label=f"Mean={mean_value:.1f}%",
+                )
+                plt.xticks(x, x_labels, rotation=0, ha="center")
+                plt.ylabel("Accuracy (%)")
+                plt.title(f"Single Best Model Accuracy ({best_accuracy_model})")
+                plt.legend(loc="upper left", frameon=False)
+                plt.ylim(0.0, max(100.0, max(values) + 3.0))
+                plt.figtext(
+                    0.5,
+                    0.01,
+                    "Split key: OOD-1/OOD-2 = out-of-distribution test sets, ID = in-distribution test set.",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                )
+                plt.tight_layout(rect=[0, 0.06, 1, 1])
+                plt.savefig(
+                    os.path.join(FINAL_PLOTS_DIR, "single_best_model_accuracy_bar.png"),
+                    dpi=180,
+                )
+                plt.close()
+        else:
+            print("WARNING: single-model summary has no test rows; skipping best-model chart.")
+    else:
+        print("WARNING: single-model summary missing; skipping best-model chart.")
+
+    best_feature_method = None
+    best_feature_method_score = None
+    top_feature_methods_df = None
+    if os.path.exists(subset_summary_path):
+        with open(subset_summary_path, "r") as handle:
+            subset_rows = json.load(handle)
+        subset_df_for_pie = pd.DataFrame(subset_rows)
+        if not subset_df_for_pie.empty:
+            valid_pie_mask = subset_df_for_pie["status"].isin(
+                ["success", "cached", "reused_subset_result"]
+            )
+            valid_pie_df = subset_df_for_pie[valid_pie_mask].copy()
+            if not valid_pie_df.empty:
+                valid_pie_df["overall_auc"] = valid_pie_df[
+                    ["mean_auc_test_set_ood_1", "mean_auc_test_set_ood_2", "mean_auc_test_set_id"]
+                ].mean(axis=1, skipna=True)
+                valid_pie_df = valid_pie_df.sort_values(
+                    ["overall_auc", "method"], ascending=[False, True]
+                )
+                top_feature_methods_df = valid_pie_df.copy()
+                best_feature_method = str(valid_pie_df.iloc[0]["method"])
+                best_feature_method_score = float(valid_pie_df.iloc[0]["overall_auc"])
+
+    if best_feature_method is not None:
+        ranking_path = os.path.join(
+            FEATURE_IMPORTANCE_DIR,
+            "aggregated",
+            best_feature_method,
+            "feature_ranking.csv",
+        )
+        if os.path.exists(ranking_path):
+            ranking_df = pd.read_csv(ranking_path)
+            ranking_df = ranking_df[
+                ~ranking_df["feature"].isin(["age", "sex"])
+            ].copy()
+            ranking_df = ranking_df.sort_values("rank", ascending=True)
+            if not ranking_df.empty:
+                all_feature_df = ranking_df.sort_values("score", ascending=True)
+                all_feature_labels = all_feature_df["feature"].astype(str).tolist()
+                all_feature_display_labels = [
+                    format_feature_label(feature_name) for feature_name in all_feature_labels
+                ]
+                all_feature_scores = all_feature_df["score"].astype(float).to_numpy()
+                all_colors = [
+                    "#4C72B0" if rank_value <= FEATURE_SUBSET_SIZE else "#AFC4E2"
+                    for rank_value in all_feature_df["rank"].astype(int).tolist()
+                ]
+
+                plt.figure(figsize=(12, max(6.0, 0.27 * len(all_feature_labels))))
+                bars = plt.barh(
+                    all_feature_display_labels,
+                    all_feature_scores,
+                    color=all_colors,
+                    alpha=0.95,
+                )
+                for bar, score_value in zip(bars, all_feature_scores):
+                    if score_value < 0.01:
+                        continue
+                    plt.text(
+                        score_value + 0.001,
+                        bar.get_y() + bar.get_height() / 2.0,
+                        f"{score_value:.3f}",
+                        ha="left",
+                        va="center",
+                        fontsize=7,
+                    )
+                plt.xlabel("Aggregated Feature Score")
+                plt.ylabel("Feature")
+                plt.title(
+                    f"All Features ({best_feature_method}, mean AUC={best_feature_method_score:.3f})"
+                )
+                plt.figtext(
+                    0.5,
+                    0.01,
+                    "Feature names are mapped in results/feature_importance/feature_definitions.csv",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                )
+                plt.tight_layout(rect=[0, 0.03, 1, 1])
+                plt.savefig(
+                    os.path.join(FINAL_PLOTS_DIR, "best_features_all_bar.png"),
+                    dpi=180,
+                )
+                plt.close()
+
+                top_feature_count = min(10, len(ranking_df))
+                pie_df = ranking_df.sort_values("score", ascending=False).copy()
+                pie_labels = [
+                    format_feature_label(feature_name)
+                    for feature_name in pie_df["feature"].head(top_feature_count).astype(str).tolist()
+                ]
+                pie_scores = pie_df["score"].head(top_feature_count).astype(float).to_numpy()
+                other_score = float(
+                    pie_df["score"].iloc[top_feature_count:].astype(float).sum()
+                )
+                if len(pie_df) > top_feature_count and other_score > 0:
+                    pie_labels.append("other_features")
+                    pie_scores = np.append(pie_scores, other_score)
+                if np.nansum(pie_scores) <= 0:
+                    pie_scores = np.ones(len(pie_labels), dtype=float)
+
+                plt.figure(figsize=(10, 7))
+                colors = plt.cm.tab20(np.linspace(0, 1, len(pie_labels)))
+                wedges, texts, autotexts = plt.pie(
+                    pie_scores,
+                    labels=pie_labels,
+                    autopct="%1.1f%%",
+                    startangle=120,
+                    colors=colors,
+                    wedgeprops={"edgecolor": "white", "linewidth": 1.0},
+                    textprops={"fontsize": 9},
+                )
+                for autotext in autotexts:
+                    autotext.set_color("black")
+                    autotext.set_fontsize(8)
+                plt.title(
+                    f"Top Features + Other ({best_feature_method}, all features included)"
+                )
+                plt.tight_layout()
+                plt.savefig(
+                    os.path.join(FINAL_PLOTS_DIR, "best_features_pie.png"),
+                    dpi=180,
+                )
+                plt.close()
+
+                def prepare_pie_parts(feature_df, score_column, label):
+                    local_df = feature_df[
+                        ~feature_df["feature"].isin(["age", "sex"])
+                    ].copy()
+                    if local_df.empty or score_column not in local_df.columns:
+                        return None
+                    local_df[score_column] = (
+                        local_df[score_column]
+                        .astype(float)
+                        .replace([np.inf, -np.inf], np.nan)
+                        .fillna(0.0)
+                    )
+                    local_df = local_df.sort_values(score_column, ascending=False)
+                    if local_df.empty:
+                        return None
+
+                    local_top_count = min(6, len(local_df))
+                    local_labels = [
+                        format_feature_label(feature_name)
+                        for feature_name in local_df["feature"].head(local_top_count).astype(str).tolist()
+                    ]
+                    local_values = (
+                        local_df[score_column].head(local_top_count).to_numpy(dtype=float)
+                    )
+                    local_other = float(
+                        local_df[score_column]
+                        .iloc[local_top_count:]
+                        .astype(float)
+                        .sum()
+                    )
+                    if len(local_df) > local_top_count and local_other > 0:
+                        local_labels.append("other_features")
+                        local_values = np.append(local_values, local_other)
+
+                    if np.nansum(local_values) <= 0:
+                        local_values = np.ones(len(local_labels), dtype=float)
+
+                    return {"label": label, "labels": local_labels, "values": local_values}
+
+                top_models_for_pie = []
+                if single_model_accuracy_df is not None:
+                    split_filter = ["test_set_ood_1", "test_set_ood_2", "test_set_id"]
+                    single_test_df = single_model_accuracy_df[
+                        single_model_accuracy_df["split"].isin(split_filter)
+                    ].copy()
+                    if not single_test_df.empty:
+                        mean_accuracy_df = (
+                            single_test_df.groupby("model", as_index=False)["accuracy_percent"]
+                            .mean()
+                            .sort_values(["accuracy_percent", "model"], ascending=[False, True])
+                        )
+                        top_models_for_pie = mean_accuracy_df["model"].head(5).astype(str).tolist()
+
+                pie_panels = []
+                for model_name in top_models_for_pie:
+                    model_feature_path = os.path.join(
+                        FEATURE_IMPORTANCE_DIR,
+                        "models",
+                        model_name,
+                        "feature_importance.csv",
+                    )
+                    if not os.path.exists(model_feature_path):
+                        continue
+                    model_feature_df = pd.read_csv(model_feature_path)
+                    prepared_model_panel = prepare_pie_parts(
+                        model_feature_df,
+                        "importance",
+                        f"{model_name} (single model)",
+                    )
+                    if prepared_model_panel is not None:
+                        pie_panels.append(prepared_model_panel)
+
+                prepared_aggregated_panel = prepare_pie_parts(
+                    ranking_df,
+                    "score",
+                    f"Aggregated best ({best_feature_method})",
+                )
+                if prepared_aggregated_panel is not None:
+                    pie_panels.append(prepared_aggregated_panel)
+
+                if pie_panels:
+                    n_panels = len(pie_panels)
+                    n_cols = min(3, n_panels)
+                    n_rows = int(np.ceil(n_panels / n_cols))
+                    fig, axes = plt.subplots(
+                        n_rows,
+                        n_cols,
+                        figsize=(5.0 * n_cols, 4.0 * n_rows),
+                    )
+                    if isinstance(axes, np.ndarray):
+                        axes = axes.flatten()
+                    else:
+                        axes = [axes]
+
+                    for panel_index, panel in enumerate(pie_panels):
+                        axis = axes[panel_index]
+                        panel_colors = plt.cm.tab20(
+                            np.linspace(0, 1, len(panel["labels"]))
+                        )
+                        _, _, autotexts = axis.pie(
+                            panel["values"],
+                            labels=panel["labels"],
+                            autopct="%1.1f%%",
+                            startangle=120,
+                            colors=panel_colors,
+                            wedgeprops={"edgecolor": "white", "linewidth": 1.0},
+                            textprops={"fontsize": 7},
+                        )
+                        for autotext in autotexts:
+                            autotext.set_color("black")
+                            autotext.set_fontsize(7)
+                        axis.set_title(panel["label"], fontsize=9)
+
+                    for panel_index in range(len(pie_panels), len(axes)):
+                        axes[panel_index].axis("off")
+
+                    fig.suptitle(
+                        "Feature Importance: Top 5 Single Models + Aggregated Best",
+                        fontsize=12,
+                    )
+                    fig.tight_layout(rect=[0, 0, 1, 0.95])
+                    fig.savefig(
+                        os.path.join(FINAL_PLOTS_DIR, "best_features_multi_pie.png"),
+                        dpi=180,
+                    )
+                    plt.close(fig)
+
+                if top_feature_methods_df is not None and not top_feature_methods_df.empty:
+                    method_display = {
+                        "hard_voting": "Hard Voting",
+                        "soft_voting": "Soft Voting",
+                        "performance_weighted_soft": "Weighted Soft",
+                        "k_filter_voting": "Top-K Voting",
+                        "stacking_logistic": "Stacking (LR)",
+                        "robust_rank_aggregation": "RRA",
+                        "mean_rank_aggregation": "Mean Rank",
+                    }
+                    method_panels = []
+                    top_methods = top_feature_methods_df["method"].head(4).astype(str).tolist()
+                    for method_name in top_methods:
+                        method_ranking_path = os.path.join(
+                            FEATURE_IMPORTANCE_DIR,
+                            "aggregated",
+                            method_name,
+                            "feature_ranking.csv",
+                        )
+                        if not os.path.exists(method_ranking_path):
+                            continue
+                        method_ranking_df = pd.read_csv(method_ranking_path)
+                        method_panel = prepare_pie_parts(
+                            method_ranking_df,
+                            "score",
+                            method_display.get(method_name, method_name),
+                        )
+                        if method_panel is not None:
+                            method_panels.append(method_panel)
+
+                    if method_panels:
+                        n_panels = len(method_panels)
+                        n_cols = min(2, n_panels)
+                        n_rows = int(np.ceil(n_panels / n_cols))
+                        fig, axes = plt.subplots(
+                            n_rows,
+                            n_cols,
+                            figsize=(5.2 * n_cols, 4.0 * n_rows),
+                        )
+                        if isinstance(axes, np.ndarray):
+                            axes = axes.flatten()
+                        else:
+                            axes = [axes]
+
+                        for panel_index, panel in enumerate(method_panels):
+                            axis = axes[panel_index]
+                            panel_colors = plt.cm.tab20(
+                                np.linspace(0, 1, len(panel["labels"]))
+                            )
+                            _, _, autotexts = axis.pie(
+                                panel["values"],
+                                labels=panel["labels"],
+                                autopct="%1.1f%%",
+                                startangle=120,
+                                colors=panel_colors,
+                                wedgeprops={"edgecolor": "white", "linewidth": 1.0},
+                                textprops={"fontsize": 7},
+                            )
+                            for autotext in autotexts:
+                                autotext.set_color("black")
+                                autotext.set_fontsize(7)
+                            axis.set_title(panel["label"], fontsize=9)
+
+                        for panel_index in range(len(method_panels), len(axes)):
+                            axes[panel_index].axis("off")
+
+                        fig.suptitle(
+                            "Top Feature Aggregation Methods (by subset AUC)",
+                            fontsize=12,
+                        )
+                        fig.tight_layout(rect=[0, 0, 1, 0.95])
+                        fig.savefig(
+                            os.path.join(FINAL_PLOTS_DIR, "best_features_methods_pie.png"),
+                            dpi=180,
+                        )
+                        plt.close(fig)
+            else:
+                print("WARNING: ranking file has no features for pie chart.")
+        else:
+            print("WARNING: best method ranking file missing for pie chart.")
+    else:
+        print("WARNING: no successful feature method found for pie chart.")
+
+    print("Final summary plots completed.")
+
+
 
 
 ###############################################################################
@@ -986,6 +2888,8 @@ def main():
     run_ensemble_methods()
     run_probability_calibration()
     run_abstain_uncertainty_logic()
+    run_feature_importance_analysis()
+    run_final_summary_plots()
 
 
 if __name__ == "__main__":

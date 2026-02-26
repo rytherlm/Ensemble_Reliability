@@ -64,7 +64,7 @@ import ast
 SEED = 42
 scoring = 'f1'
 n_jobs = 8
-RESULTS_BASE_DIR = os.path.join("results")
+RESULTS_BASE_DIR = os.path.join("results", "model_outputs")
 MODELS_BASE_DIR = RESULTS_BASE_DIR
 
 def create_results_structure(sets=("train", "test_1", "test_2", "test_3")):
@@ -366,9 +366,9 @@ parameters.update({"ETC": {
 # removed for speed, with real runs add lopo back for all models to be run
 # for name, classifier in classifiers.items():
 
-# Temporary debugging restriction: run only the first two models.
-model_items = list(classifiers.items())[:4]
-# model_items = list(classifiers.items())
+# Temporary runtime restriction: run the first eight models for faster iteration.
+# model_items = list(classifiers.items())[:8]
+model_items = list(classifiers.items())
 
 for name, classifier in model_items:
     results = create_results_structure()

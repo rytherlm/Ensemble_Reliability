@@ -35,7 +35,7 @@ import wfdb
 #                             2. Configurations                               #
 ###############################################################################
 N_FEATURES = 30
-MAX_PER_SPLIT = 500
+MAX_PER_SPLIT = 100
 
 FEATURE_NAMES = [f"feature_{ii:02d}" for ii in range(1, N_FEATURES + 1)]
 MI_CODES = {"AMI", "ASMI", "IMI", "LMI"}
